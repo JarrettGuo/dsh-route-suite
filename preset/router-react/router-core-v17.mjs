@@ -147,9 +147,18 @@ export function classifyTask(text) {
 
 /** Per-session mode derived from durable events (resume-safe). */
 export function sessionMode(session) {
-  const events = session.events
-  const userMsg = events.find((e) => e.type === 'user/message')
+  const events = sessionEvents(session)
+  const userMsg = events.find((e) => e.type === 'user/message' && e.data?.source?.kind !== 'plugin')
+    ?? events.find((e) => e.type === 'user/message')
   return classifyTask(extractText(userMsg?.data))
+}
+
+export function sessionEvents(session) {
+  if (Array.isArray(session?.events)) return session.events
+  if (typeof session?.snapshotEvents === 'function') {
+    try { return session.snapshotEvents() } catch { /* unavailable during teardown */ }
+  }
+  return []
 }
 
 export function extractText(data) {
@@ -173,7 +182,7 @@ export function clamp01(v) {
  */
 export function applyPersona(sections, personaText) {
   const rest = (sections || []).filter(
-    (section) => section.name !== 'persona' && !/persona/i.test(section.name),
+    (section) => section.name !== 'persona' && section.name !== 'deployment:persona-prefix' && section.name !== 'router-persona',
   )
   return [...rest, { name: 'router-persona', text: personaText, order: 0 }]
 }

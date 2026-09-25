@@ -30,7 +30,7 @@ speced plan → check-in → group close-out → final check, with redteam gate 
 git clone https://github.com/yjh051108/dsh-routing-suite.git
 cd dsh-routing-suite
 
-# 2. One-shot install (injector assembly + preset copy + layout self-check + restart prompt)
+# 2. One-shot install (injector assembly + preset copy + graded install + layout self-check + restart prompt; honors DSH_HOME, FORCE=1 overwrites)
 .\install.ps1
 ```
 
@@ -41,27 +41,37 @@ Or manually:
 dsh plugin --profile web add .\injector
 # If dsh is not on PATH (npx @deepseek-ai/dsh web): npx '@deepseek-ai/dsh' plugin --profile web add .\injector
 
-# Step 2: install the router presets (one or both; DSH scans one level only,
+# Step 2: install the router presets (one or all; DSH scans one level only,
 # so each preset directory must sit FLAT under .agent-presets)
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-standard'
+$target = Join-Path $env:DSH_HOME '.agent-presets\router-standard'
 Copy-Item -Recurse .\preset\router-standard $target
 
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-spec'
+$target = Join-Path $env:DSH_HOME '.agent-presets\router-spec'
 Copy-Item -Recurse .\preset\router-spec $target
 
-# Step 3: restart DSH → pick Router Standard / Router Spec in a new session
+$target = Join-Path $env:DSH_HOME '.agent-presets\router-react'
+Copy-Item -Recurse .\preset\router-react $target
+
+# Step 3 (optional): install graded mode (experimental; ships prebuilt in-repo;
+# activate with /分级 on — zero footprint while inactive)
+dsh plugin --profile web add .\graded\dsh-external-dsh-graded-mode-0.0.1-rc1.tgz
+
+# Step 4: restart DSH → pick Router Standard / Router Spec / Router React in a new session
 ```
 
 > Do NOT copy the `preset` directory as a whole — the extra nesting hides the
 > presets from DSH discovery.
+
+**DSH Target**: `>=0.1.0-rc.6 <0.2.0` (tracked through rc.8 / 0.1.1-rc.2 / 0.1.2-alpha.1 / **0.1.5-rc.3**;
+breaking-change log in `preset/CHANGELOG.md`).
 
 ## Components
 
 | Path | Repo | Version | Role |
 |---|---|---|---|
 | `injector/` | [dsh-super-injector](https://github.com/yjh051108/dsh-super-injector) | [v0.3.3](https://github.com/yjh051108/dsh-super-injector/releases/tag/v0.3.3) | Runtime injector: dev_* tool family (inject / hot-reload / staging-promote / uninject / route self-heal); git installs build automatically (prepare hook) |
-| `preset/` | [dsh-router-standard](https://github.com/yjh051108/dsh-router-standard) | [v0.3.0 … mainline v1.19.1/v34](https://github.com/yjh051108/dsh-router-standard/releases/tag/v0.3.0) | Reasoning-mode routing presets: router-standard (classified persona + full sections) / router-spec (deep-think-first). router-pro is planned but NOT part of v0.3.0 |
-| `graded/` | [dsh-graded-mode](https://github.com/yjh051108/dsh-routing-suite/tree/main/graded) | [v3.2.0](https://github.com/yjh051108/dsh-routing-suite/releases) | Graded mode: session-level two-level task protocol (brainstorm quiz alignment → North-Star finalization → speced plan → spec-driven injection → check-in → group close-out → final check); 6 tools + 3 modes + per-item mode + redteam gate + audit endpoint; `graded/dsh-graded-mode-3.2.0.tgz` is a direct `dsh plugin --profile web add` target |
+| `preset/` | [dsh-router-standard](https://github.com/yjh051108/dsh-router-standard) | [v0.3.0 … mainline v1.19.1/v34](https://github.com/yjh051108/dsh-router-standard/releases/tag/v0.3.0) | Reasoning-mode routing presets: router-standard (classified persona + full sections) / router-spec (deep-think-first) / router-react (RL first-turn direct-call, experimental; now part of the install chain). router-pro is planned but NOT part of v0.3.0 |
+| `graded/` | [dsh-graded-mode](https://github.com/yjh051108/dsh-routing-suite/tree/main/graded) | [v0.0.1-rc1](https://github.com/yjh051108/dsh-routing-suite/releases) | Graded mode (experimental): session-level two-level task protocol (brainstorm quiz alignment → North-Star finalization → speced plan → spec-driven injection → check-in → group close-out → final check); 6 tools + 3 modes + per-item mode + redteam gate + audit endpoint; the in-repo prebuilt `graded/dsh-external-dsh-graded-mode-0.0.1-rc1.tgz` is a direct `dsh plugin --profile web add` target |
 
 > Versions follow each component repo's git tag (links go to the matching Release).
 

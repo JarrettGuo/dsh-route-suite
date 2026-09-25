@@ -158,10 +158,20 @@ export function classifyTask(text) {
  * user-origin message exists.
  */
 export function sessionMode(session) {
-  const events = session.events
+  const events = session.events || (typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : [])
   const userMsg = events.find((e) => e.type === 'user/message' && (e.data?.source?.kind === 'user' || e.data?.source?.kind === undefined))
     ?? events.find((e) => e.type === 'user/message')
   return classifyTask(extractText(userMsg?.data))
+}
+
+// 新增辅助（router-core）：
+export function sessionEvents(session) {
+  if (!session) return []
+  if (Array.isArray(session.events)) return session.events
+  if (typeof session.snapshotEvents === 'function') {
+    try { return session.snapshotEvents() } catch { return [] }
+  }
+  return []
 }
 
 export function extractText(data) {
@@ -185,7 +195,7 @@ export function clamp01(v) {
  */
 export function applyPersona(sections, personaText) {
   const rest = (sections || []).filter(
-    (section) => section.name !== 'persona' && !/persona/i.test(section.name),
+    (section) => section.name !== 'persona' && section.name !== 'deployment:persona-prefix' && section.name !== 'router-persona',
   )
   return [...rest, { name: 'router-persona', text: personaText, order: 0 }]
 }

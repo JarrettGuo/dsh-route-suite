@@ -21,7 +21,7 @@
 
 import {
   applyPersona, bandFor, bandOf, coreFor, parseMode, personaFor, sessionMode, testinessFor, clamp01,
-  isComplexTask,
+  isComplexTask, sessionEvents,
 } from './router-core.mjs'
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -117,7 +117,7 @@ export function apply(ctx, config) {
       core = new Set(legacyCore(mode))
     }
 
-    if (session.events.some((event) => event.type === 'tool/call')) {
+    if (sessionEvents(session).some((event) => event.type === 'tool/call')) {
       return { ...assembled, sections, contexts: [] } // promoted: full catalog
     }
 
@@ -127,6 +127,9 @@ export function apply(ctx, config) {
       throw new Error(`${name}: no platform shell in catalog`)
     }
     core.add(shell)
+    // 视觉模型（v4-flash-vision-exp 等）：首轮面齐平标准模式——read_image 直接可用
+    // （官方已声明 image 输入；首轮即读图，无需等 promoted 全量目录）。
+    if (/vision/i.test(String(modelId || '')) && available.has('read_image')) core.add('read_image')
 
     return {
       ...assembled,

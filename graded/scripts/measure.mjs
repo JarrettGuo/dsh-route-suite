@@ -5,7 +5,8 @@
  * 用法：node scripts/measure.mjs <session.jsonl> [--json]
  *       node scripts/measure.mjs --selftest        # 小样自测
  *
- * 输出：指标行（工具调用/标定/截图/红队/模式/分三段衰减）——聚合法见 docs/STUDY.md §2。
+ * 输出：事件级指标（工具调用不含 mark_task、标定、read_image 次数、红队调用、按事件索引三等分）。
+ * 不按小类切段，也不计屏幕截图产出；不可由此脚本独立复算历史会话的逐项衰减表。
  */
 import { readFileSync } from 'node:fs'
 
@@ -23,26 +24,28 @@ function parseEvents(path) {
 function measure(ev) {
   const tools = {}, marks = []
   let readImages = 0, redteam = 0
-  const texts = []
   for (const o of ev) {
     const t = o?.type, d = o?.data
     if (t === 'tool/call') {
       const n = d?.name
-      if (n === 'mark_task') marks.push({ level: JSON.parse(d.arguments || '{}')?.level, title: JSON.parse(d.arguments || '{}')?.title })
-      else tools[n] = (tools[n] || 0) + 1
+      if (n === 'mark_task') {
+        let args = {}
+        try { args = typeof d.arguments === 'string' ? JSON.parse(d.arguments) : d.arguments || {} } catch { /* malformed tool args still count as a mark attempt */ }
+        marks.push({ level: args?.level, title: args?.title })
+      } else if (n) tools[n] = (tools[n] || 0) + 1
       if (n === 'read_image') readImages++
       if (n === 'redteam_verdict') redteam++
     }
   }
   const totalTools = Object.values(tools).reduce((a, b) => a + b, 0)
-  // 分段：按事件索引三等分（早/中/晚）——工具调用按分段切
+  // 分段：按事件索引三等分（早/中/晚），不是按小类；工具数与总数均不含 mark_task。
   const n = ev.length
   const segStats = SEGMENTS.map((name, i) => {
     const part = ev.slice(Math.floor(n * i / 3), Math.floor(n * (i + 1) / 3))
-    const toolsInSeg = part.filter((o) => o?.type === 'tool/call')
+    const toolsInSeg = part.filter((o) => o?.type === 'tool/call' && o?.data?.name && o.data.name !== 'mark_task')
     return {
       name,
-      tools: toolsInSeg.length, // 事件级（含标定——口径同"tool/call 事件总数"）
+      tools: toolsInSeg.length,
       readImages: toolsInSeg.filter((o) => o?.data?.name === 'read_image').length,
     }
   })
@@ -69,7 +72,7 @@ function textRow(m) {
 }
 
 function selftest() {
-  // 小样夹具：10 事件 → 3 工具调用（1 read_image + 2 pwsh）+ 2 标定 + 若干非工具
+  // 小样夹具：3 工具调用（1 read_image + 2 pwsh）+ 2 标定 + 若干非工具
   const ev = []
   const push = (type, data) => ev.push({ type, data })
   for (let i = 0; i < 4; i++) push('user/message', { content: [{ type: 'text', text: `hello ${i}` }] })
@@ -81,7 +84,7 @@ function selftest() {
   push('tool/call', { name: 'mark_task', arguments: JSON.stringify({ level: 'L1', title: '组', status: 'completed' }) })
   push('tool/result', { message: { content: [{ type: 'tool-result', text: 'ok' }] } })
   const m = measure(ev)
-  const ok = m.tools === 3 && m.readImages === 1 && m.marks === 2 && m.markL2 === 1 && m.markL1 === 1 && m.redteam === 0 && m.segments.reduce((a, b) => a + b.tools, 0) === 5
+  const ok = m.tools === 3 && m.readImages === 1 && m.marks === 2 && m.markL2 === 1 && m.markL1 === 1 && m.redteam === 0 && m.segments.reduce((a, b) => a + b.tools, 0) === m.tools
   if (!ok) { console.error('SELFTEST FAIL', JSON.stringify(m)); process.exit(1) }
   console.log('SELFTEST OK |', textRow(m))
   return m

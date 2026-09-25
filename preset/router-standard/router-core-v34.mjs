@@ -196,13 +196,16 @@ export function clamp01(v) {
 }
 
 /**
- * Replace only the persona section of an assembled section list, keeping
+ * Replace only the persona prefix section of an assembled section list, keeping
  * everything else — the plan-mode section above all, which is toggled per
- * plan state and carries the plan-boundary instructions.
+ * plan state and carries the plan-boundary instructions, and the
+ * `deployment:persona-suffix` section, which DSH renders separately.
+ * Matching is by exact section name: an over-broad `/persona/i` also removed
+ * the runtime suffix, silently dropping it after the router took over.
  */
 export function applyPersona(sections, personaText) {
   const rest = (sections || []).filter(
-    (section) => section.name !== 'persona' && !/persona/i.test(section.name),
+    (section) => section.name !== 'persona' && section.name !== 'deployment:persona-prefix' && section.name !== 'router-persona',
   )
   return [...rest, { name: 'router-persona', text: personaText, order: 0 }]
 }

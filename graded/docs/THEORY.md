@@ -65,7 +65,7 @@ Performer（Choromanski et al., ICLR 2021，FAVOR+ 随机特征）、RWKV（Peng
   **未裁决通过不得打卡**——引入独立冷视角，防止"开发方自说自话"）。
 
 **实测证据**：
-- 会话 bcad0ade 强度表（中后期小类工具/截图投入对比——详见 DATA.md）；
+- 会话 bcad0ade 强度表（中后期小类工具/`read_image` 投入对比——详见 DATA.md；注：该表为作者逐小类统计，原始 JSONL 未随仓库发布，公开 `scripts/measure.mjs` 不可复算）；
 - 会话 7abc5cad（31 打卡全链、2 次红队裁决 pass）；
 - 单注率 `uniqueRate=1` 与当下态回执（防"重复注入产生的麻木"）。
 
@@ -85,7 +85,7 @@ Performer（Choromanski et al., ICLR 2021，FAVOR+ 随机特征）、RWKV（Peng
 | 线性注意力（上下文线性化） | ① 注入幂等：注入键（l1-guidance/focus:*/check:*…）**先注后键，每键恰 1 次**（`src/tools.js` registerInjected、`src/index.js` pre-step splice 见键跳过）② 增量注入：每小类只注入当前焦点+相邻锚；回执=当下态（不重放全树） | 会话 f0855822（自测链）链尾审计实机：`injections={focus:*:22, check:*:7,…}`、`uniqueRate=1`、`dupKeys=[]`（**每引导键恰一次=上下文无平方级重放**）；测试 `mode-state.test「auditBody：注入前缀聚合…」` | 通过 |
 | 双边注意力（双向↔聚焦二分） | ① 双向期：脑暴（信息对齐 360°）/审核（完整规格单）/终验（全面复查）② 聚焦期：执行注入"相邻锚，别想全局"（`inject-text.js` verifyLaw correct ③） | 测试 `inject-text.test「verifyLaw…两遍法」`、`「finalCheck…不可替代为指标」`（① 全面复查断言）；`specSheet` 锁定即呈完整单（北极星+需求+树——双向视角物化于锁定时刻） | 通过 |
 | jspace 概念 | **（无映射——占位）** | 未定义不映射：待用户补定义/出处后补行 | 未证实（边界） |
-| 思维惯性懈怠（勤勉度衰减防御） | ① 打卡制（每小类硬门）② 红队门（verify=redteam 未裁决通过不得 mark——`src/tools.js` markTaskDefinition redteam 门）③ 组收官逐条核对（严苛>小类）④ 北极星锚定（开工前一眼，替代声明式自问）——注：v3.0 的"变体轮换"已在 v3.1 由**结构差异注入**取代（退役） | 会话 bcad0ade 强度表（中后期工具投入/截图对比衰减——见 DATA.md）；会话 7abc5cad：31 打卡全链+**redteam_verdict 2 次 pass**（L2 定稿取景/L1 组收官）；测试 `tools.test「redteam 门：未 pass 无法打卡…」`、`inject-text.test「starAnchor…」`（星锚替代自问） | 通过 |
+| 思维惯性懈怠（勤勉度衰减防御） | ① 打卡制（每小类硬门）② 红队门（verify=redteam 未裁决通过不得 mark——`src/tools.js` markTaskDefinition redteam 门）③ 组收官逐条核对（严苛>小类）④ 北极星锚定（开工前一眼，替代声明式自问）——注：v3.0 的"变体轮换"已在 v3.1 由**结构差异注入**取代（退役） | **机制**：测试 `tools.test「redteam 门：未 pass 无法打卡…」`、`inject-text.test「starAnchor…」`（星锚替代自问）——可复现。**会话数字**：bcad0ade 强度表（中后期工具/`read_image` 投入对比——见 DATA.md）、7abc5cad 31 打卡+redteam 2 次 pass——作者报告，缺原始 JSONL，**不可独立复现**（故本行"通过"仅指机制层） | 通过（机制层；会话数字不可复现） |
 
 **映射覆盖**：四项理论 → 条目 4 行（3 条通过映射 + 1 条未证实占位）；每条映射的实测证据均带
 「会话ID/审计/测试名」复现路径——可复核性为验收底线（research 模式）。

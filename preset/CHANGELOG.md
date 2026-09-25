@@ -1,5 +1,53 @@
 # Changelog
 
+## v1.29.0 — DSH 0.1.5-rc.3 适配收口（sessionEvents 迁移 + fork 继承 + 幽灵名清理）
+
+> 版本戳：`ROUTER_VERSION` 已回填至本版（F7，t5 复测；CHANGELOG 先例 v1.17.1「版本戳统一」——
+> v1.21.0-v1.27.0 七版从未 bump 的漂移自此对齐）。上游 v1.28.0 条目未随本仓库合入，编号跳过。
+
+本版在未提交兼容修改（persona `prefix`、goal shim 消息身份、子会话豁免、skill 白名单、
+~/.dsh 回退等）基础上收口剩余差距。对应 issues：#110（吸收）、#125、#128（吸收）、
+#92（吸收 PR#99）、#69、#79；DSH Target 补记 0.1.5-rc.3。
+
+**Session API 迁移收口（#110 吸收 + 分诊新发现）**：
+- router-bootstrap(-v34).mjs 残留 4 处裸 `session.events` 全部迁到 core 的
+  `sessionEvents()` 双兼容读法（sessionFresh / memoryMuted / firstUserTask /
+  markStageConsumed）——0.1.5-rc.3 下 Session 已无公开 events 数组，此前
+  sessionFresh 恒 false、memoryMuted 恒 false、firstUserTask 恒空、consumed 水位
+  永不落盘（全部静默失效）。
+- bootstrap 行 `?v=88` → `?v=91`（绕 ESM 缓存）。
+
+**fork / 委派语义分化（#69，注意与 #119 的关系）**：
+- 本机 0.1.5-rc.3 读码证实两种子会话共用 `header.parentSession`，但委派子会话
+  额外携带 `origin:'subagent'` + `delegationDepth`（dsh-subagent childSessionMeta），
+  而 `Session.fork()`（"在新对话中分支"）只设 parentSession + isSeeded。
+- 豁免判定改为 `isDelegatedSession()`（origin==='subagent'）——#119 的委派豁免语义不变；
+- fork 会话正常参与路由，并从父会话**继承阶段记录**（stage/guided/consumed）；
+  consumed 以子会话种子事件数为水位，父历史完成信号不重复计入（防二次跳级）；
+  phase_begin 的 sessionFresh 重置对 fork 失效（seed 可能携带父的 initial header）。
+
+**记忆工具判定与幽灵名（#128 吸收 + #125）**：
+- `isMemoryTool` → `/^(engram|mnemon)_/`（部分部署记忆工具由 dsh-mnemon 提供）；
+  categorizeDomain 补 mnemon；META_LIVE 移除悬空 `dev_page_check`；
+  STAGES/GLOBAL_SAFE 移除全组 engram_* 幽灵名（本机记忆提供方为
+  @openviking/dsh-memory-plugin 服务，非 engram_*/mnemon_* 工具行）。
+- #125 主诉：stageText 四个 muted replace 模式对现行 STAGE_GUIDES 文本**逐条零匹配**
+  （模式写的是旧版括号文本）——改为锚定现行文本（`+ memory recall/verify/respond`
+  等 5 处），guide1 的 "into memory (engram_store)" 去 engram 化；selftest 新增
+  「模式必须锚定现行文本」断言，integration 新增「muted 输出不含 memory/engram 引导」行为断言。
+
+**阶段解锁保留 own-scope shadow（#92，吸收 PR#99）**：解锁只补缺失——先探测
+own-layer 是否已有同名定义（has/get/data.has 三形状）再注册内置版；移除
+`scoped.delete(name)`（会把解锁档位内插件的 agent-scope 工具定义删掉）。
+
+**web_fetch 门控补全（#79）**：web_fetch 补进阶段 0（了解/对齐）+ START_GUIDE
+Unlock order + STAGE_GUIDES[0] 知识缺口规则（超出模型知识的事实先 search→fetch 取证，
+不猜 API 细节）；宿主未注册该工具时由 known 过滤自然剔除。
+
+验证：selftest PASS；`node --test router.test.mjs` 27/27、`router.integration.test.mjs`
+40/40（新增：shadow 保留 ×3 形状、snapshotEvents-only 会话 muted/任务回显、consumed
+水位 ×2、fork 继承）；graded 64/64。
+
 ## v1.27.0 — 隔离与并行（注意力工程 · 支柱4）
 
 **支柱4 隔离与并行**：当两个独立关注点污染单线程、或一个子问题吞噬主线预算时，用 subagent/workflow

@@ -76,6 +76,27 @@ verified against `@deepseek-ai/dsh-agent-loop` (0.1.0-rc.7) event ordering:
 - **New**: `router.integration.test.mjs` replays the real claim → assemble →
   pre-step ordering against the actual bootstrap code.
 
+## DSH 0.1.5-rc.3 compatibility fixes
+
+- **Persona rows use `prefix`**: `@deepseek-ai/dsh-persona` now requires
+  `config.prefix`; the removed `text` key fails the mount with
+  `$.prefix missing required value`. The router rewrites only the
+  `deployment:persona-prefix` section by exact name, so the runtime
+  `deployment:persona-suffix` survives promotion.
+  `router.integration.test.mjs` asserts the static contract and — when a DSH
+  install is present — validates every shipped row against the real
+  `dsh-persona` Config (skipped otherwise; set `DSH_PERSONA_PLUGIN` to force a
+  specific install).
+- **Goal-round notices are identified**: the `update_goal` shim's
+  `deferContext()` message carries `id` and `source.summary`, matching
+  `dsh-tool-goal`'s `createUserMessage()`; DSH rejects unidentified surface
+  events ("lacks an identified message").
+- **Delegated children skip stage gating** (claim/pre-step/assemble/restrict),
+  `skill` stays visible through the stage whitelist, and react/spec read
+  `session.snapshotEvents()` (falling back to `session.events`).
+- **State paths fall back to `~/.dsh`**, not the bare home directory, when
+  `DSH_HOME` is unset.
+
 ## What it does
 
 **router-standard**: reads the session's first REAL user message, classifies
@@ -215,8 +236,14 @@ keywords):
 ## Tests
 
 ```sh
-node --test router.test.mjs   # 11 tests: classification, bands, personas, plan-section survival
+node --test router.test.mjs             # 27 tests: classification, bands, personas, memory-tool判定/幽灵名
+node --test router.integration.test.mjs # 40 tests: claim → assemble → pre-step, persona/suffix, goal shim, shadow 保留/水位/fork 继承
+npm test                                # both files (67 tests)
 ```
+
+> 注（口径校准，G3）：本 README 早前写「11 tests」→「30/56」，均落后于实际文件；
+> 本次复测实测 `router.test.mjs` 27 项、`router.integration.test.mjs` 40 项、共 67 项。
+> 测试为 Cordis mock / 源码级验证，**不等于**真实模型上的效果数字；效果宣称的可验证性见 `docs/VERIFIABILITY.md`。
 
 ## Files
 

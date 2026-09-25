@@ -9,7 +9,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 AGENT_PRESETS_DIR="$DSH_HOME/.agent-presets"
 INJECTOR_DIR="$ROOT/injector"
-PRESET_NAMES=("router-standard" "router-spec")
+# G5（t1 差距清单）：router-react 纳入安装链（此前修复做完却没有安装/验证路径）
+PRESET_NAMES=("router-standard" "router-spec" "router-react")
+# G6：FORCE=1 ./install.sh 覆盖已存在预设（默认跳过，防覆盖用户改动）
+FORCE="${FORCE:-0}"
 
 # 输出着色（非终端自动禁用）
 if [ -t 1 ]; then
@@ -111,8 +114,13 @@ for name in "${PRESET_NAMES[@]}"; do
   fi
   target="$AGENT_PRESETS_DIR/$name"
   if [ -d "$target" ]; then
-    warn "预设已存在：$target（如需覆盖请先手动删除）"
-    continue
+    if [ "$FORCE" = "1" ]; then
+      warn "预设已存在：$target（FORCE=1 覆盖重装）"
+      rm -rf "$target"
+    else
+      warn "预设已存在：$target（如需覆盖：FORCE=1 ./install.sh）"
+      continue
+    fi
   fi
   # 平铺复制：agent-presets 只扫一级子目录，每个预设目录必须直接含 agent.cordis.yml
   cp -R "$ROOT/preset/$name" "$target"
@@ -134,8 +142,28 @@ if [ "$failed" -ne 0 ]; then
   err '预设布局自检失败——请勿复制 preset 整目录（会多套一层），每个预设目录需直接含 agent.cordis.yml'
 fi
 
+# graded（分级模式，实验组件；#114 同步）：仓库内预构建 tgz 直接装配；不激活零痕迹。
+# SKIP_GRADED=1（t9 口径）：跳过 graded 装配——与注入器 provisionGraded=false 同口径
+# （0.0.1-rc1 实验组件不自动写入 profile；显式 opt-in 才装）。默认不设置 = 沿用装配行为。
+GRADED_TGZ="$ROOT/graded/dsh-external-dsh-graded-mode-0.0.1-rc1.tgz"
+GRADED_LINK="$DSH_HOME/profiles/web/node_modules/@dsh-external/dsh-graded-mode"
+if [ "${SKIP_GRADED:-0}" = "1" ]; then
+  warn 'SKIP_GRADED=1——按 provisionGraded=false 口径跳过 graded（不写 profile；需要时手动 dsh plugin add）'
+elif [ -f "$GRADED_LINK/package.json" ]; then
+  ok "graded 已安装：$GRADED_LINK（跳过）"
+elif [ -f "$GRADED_TGZ" ]; then
+  if command -v dsh >/dev/null 2>&1; then
+    dsh plugin --profile web add "$GRADED_TGZ" || warn 'graded 装配失败（可忽略，不影响 router 预设）'
+  else
+    npx '@deepseek-ai/dsh' plugin --profile web add "$GRADED_TGZ" || warn 'graded 装配失败（可忽略，不影响 router 预设）'
+  fi
+else
+  warn "graded tgz 缺失（$GRADED_TGZ）——跳过（也可从 Release 附件获取后手动 dsh plugin add）"
+fi
+
 info '[4/4] 完成'
 echo '1. 重启 DSH（web 服务）'
-echo '2. GUI 新建会话 → 选择 Router Standard / Router Spec (experimental)'
+echo '2. GUI 新建会话 → 选择 Router Standard / Router Spec (experimental) / Router React'
 echo '3. 发任务：生成任务自动 react，维护任务自动 spec，模糊任务进 weak 内路由'
-echo '4. AI 自优化工具：dev_router_status / dev_router_mode / dev_mode_subagent'
+echo '4. 分级模式（可选）：会话内 /分级 on 激活，不激活零痕迹'
+echo '5. AI 自优化工具：dev_router_status / dev_router_mode / dev_mode_subagent'

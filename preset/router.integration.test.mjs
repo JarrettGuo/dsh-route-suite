@@ -17,13 +17,28 @@
  * API call manufactured by inbox re-append guidance (#55).
  */
 import assert from 'node:assert/strict'
-import test from 'node:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import test, { after } from 'node:test'
+import { spawnSync } from 'node:child_process'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply as applyStandard } from './router-standard/router-bootstrap-v34.mjs' // v1.18.3：测试面=运行面（agent.cordis.yml 挂载 -v34）
+import { pathToFileURL } from 'node:url'
+import { apply as applyStandard, runtimeCallable, runtimeMark } from './router-standard/router-bootstrap-v34.mjs' // v1.18.3：测试面=运行面（agent.cordis.yml 挂载 -v34）
 import { apply as applySpec } from './router-spec/router-bootstrap-v10.mjs' // v1.18.3: 测试面=运行面（agent.cordis.yml 挂载 -v10）
-import { classifyTask, sessionMode } from './router-standard/router-core.mjs'
+import { applyPersona as applyStandardPersona, classifyTask, sessionMode } from './router-standard/router-core.mjs'
+import { applyPersona as applyReactPersona, sessionEvents as reactEvents, sessionMode as reactSessionMode } from './router-react/router-core-v17.mjs'
+import { applyPersona as applySpecPersona, sessionEvents as specEvents, sessionMode as specSessionMode } from './router-spec/router-core-v10.mjs'
+
+// apply() writes diagnostic files; never let a test touch the user's live ~/.dsh.
+const previousDshHome = process.env.DSH_HOME
+const testDshHome = mkdtempSync(join(tmpdir(), 'dsh-router-integration-home-'))
+process.env.DSH_HOME = testDshHome
+after(() => {
+  if (previousDshHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = previousDshHome
+  rmSync(testDshHome, { recursive: true, force: true })
+})
 
 // ── minimal Cordis-shaped context ──────────────────────────────────────────
 
@@ -172,6 +187,112 @@ test('plugin-origin claimed messages never pin the band or receive guides', asyn
   assert.deepEqual(decision.messages.map((m) => m.id), ['a1', 'm4']) // no bootstrap guide for plugin-origin messages
 })
 
+test('delegated child skips progressive stage injection and restrictions', async () => {
+  const h = makeHarness(applyStandard, {})
+  const session = makeSession([{ type: 'tool/call', data: { name: 'todo_write' } }])
+  // 真实 DSH 委派子会话 header（dsh-subagent childSessionMeta）：parentSession + origin:'subagent'
+  // （+ delegationDepth）。#69 修复后仅此形态豁免；裸 parentSession（fork/分支）正常参与路由。
+  session.header.parentSession = 'parent-session'
+  session.header.origin = 'subagent'
+  session.header.delegationDepth = 1
+  const restrictions = []
+  const agent = { session, ctx: { get(name) { return name === 'tools' ? { restrict(cfg) { restrictions.push(cfg) } } : undefined } } }
+  h.agentRef.current = agent
+  const original = baseAssembled()
+  const assembled = await h.assemble(original, { agent, scope: agent })
+  assert.equal(assembled, original)
+  const step = await h.preStep({ agent, messages: [userMessage('child-msg', 'fix issue')] })
+  assert.deepEqual(step.messages.map((m) => m.id), ['child-msg'])
+  assert.equal(restrictions.length, 0)
+})
+
+// ── #116/#117: host meta tools survive progressive disclosure ──────────────
+
+/** Slice a top-level `const NAME = [ ... ]` literal out of a source file. */
+function arrayLiteralSource(src, name) {
+  const start = src.indexOf(`const ${name} = [`)
+  assert.ok(start >= 0, `${name} declaration found`)
+  const end = src.indexOf(']', start)
+  assert.ok(end > start, `${name} literal closed`)
+  return src.slice(start, end + 1)
+}
+
+test('stage whitelists ship the host skill tool (#116/#117)', () => {
+  const src = readFileSync(new URL('./router-standard/router-bootstrap-v34.mjs', import.meta.url), 'utf8')
+  // `skill` must be in GLOBAL_SAFE (the platform-safe filter in applyStageRestrict) AND in
+  // META_LIVE (→ META_ALL, the always-available meta tier). Dropping it from either array
+  // removes it from the stage callable surface — see the behavioural test below.
+  assert.match(arrayLiteralSource(src, 'GLOBAL_SAFE'), /'skill'/)
+  assert.match(arrayLiteralSource(src, 'META_LIVE'), /'skill'/)
+})
+
+test('promoted stage keeps the host skill tool in the visible/callable surface (#116/#117)', async () => {
+  process.env.DSH_ROUTER_STAGE_FILE = tmpStageFile()
+  const h = makeHarness(applyStandard, {})
+  const session = makeSession([{ type: 'tool/call', data: { name: 'read' } }]) // promoted
+  const restrictCalls = []
+  const visible = new Map([['skill', {}], ['read', {}], ['phase_begin', {}]])
+  const toolsSvc = {
+    register() {},
+    schemas() { return [] },
+    view() { return { knownNames: [...visible.keys()], visible, restrictableNames: [...visible.keys()] } },
+    restrict(cfg) { restrictCalls.push(cfg); return () => {} },
+  }
+  const agent = {
+    session,
+    options: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+    ctx: { get(name) { return name === 'tools' ? toolsSvc : undefined } },
+  }
+  h.agentRef.current = agent
+
+  const assembled = await h.assemble(baseAssembled(), { agent, scope: agent })
+  assert.ok(assembled.sections.some((s) => s.name === 'router-stage'), 'promoted assembly renders the stage section')
+  assert.ok(runtimeCallable(toolsSvc, agent).includes('skill'), 'skill is bound on the runtime visible surface')
+  assert.equal(runtimeMark(toolsSvc, agent, 'skill'), 'meta', 'skill is reported as a live meta tool (META_ALL)')
+
+  const begin = h.registeredTools.find((t) => t.name === 'phase_begin')
+  assert.ok(begin, 'phase_begin registered')
+  await begin.execute()
+  const allow = restrictCalls.at(-1)?.allow ?? []
+  assert.ok(allow.includes('skill'), 'skill survives the stage restrict (callable surface)')
+  assert.ok(allow.includes('read'), 'ordinary stage tools stay callable')
+
+  // Promoted sessions live at stage >= 1: the next stage must keep skill too.
+  const advance = h.registeredTools.find((t) => t.name === 'phase_advance')
+  assert.ok(advance, 'phase_advance registered')
+  await advance.execute({ reason: 'test' })
+  const allowNext = restrictCalls.at(-1)?.allow ?? []
+  assert.ok(allowNext.includes('skill'), 'skill survives the next stage restrict')
+})
+
+// ── #13: plugin-origin messages never pin the band ─────────────────────────
+//
+// 行为对齐（引用 router-standard #13）：真实链路里 `agent/inbox/claimed` 先送达宿主
+// 插件消息（approval / runtime-context / router 引导），随后才是本轮的**真实用户消息**。
+// 三套预设的 `sessionMode()` 因此都跳过 `data.source.kind === 'plugin'` 的 user/message
+// 做档位钉定（standard/router-core.mjs 的 `#13` 注释、react/router-core(-v17).mjs、
+// spec/router-core(-v10).mjs 均含该过滤），否则插件文案（例如包含 build/create 字样的
+// 审批说明）会把整轮误钉成 react 档。下面的单测固定该行为，防止回退成"取首条 user/message"。
+
+test('#13: a leading plugin-origin user/message never pins the band (standard/react/spec)', () => {
+  const reactText = '从零开发一个马里奥网页游戏，生成完整实现，构建可运行的网站应用'
+  const neutralText = '你好，帮我看一下这段代码'
+  assert.equal(classifyTask(reactText), 1) // would pin the react band if honoured
+  assert.equal(classifyTask(neutralText), 'weak')
+  // First durable user/message is a plugin notice (approval / runtime-context); the real
+  // user message follows in the same turn. The plugin text must NOT pin the band.
+  const pluginMsg = { id: 'approval-1', role: 'user', source: { kind: 'plugin', plugin: 'user-approval' }, content: [{ type: 'text', text: reactText }] }
+  const realMsg = userMessage('m1', neutralText)
+  const events = [{ type: 'user/message', data: pluginMsg }, { type: 'user/message', data: realMsg }]
+  for (const [label, mode] of [['standard', sessionMode], ['react', reactSessionMode], ['spec', specSessionMode]]) {
+    assert.equal(mode({ events }), 'weak', `${label}: the real (neutral) message pins the band, not the plugin notice`)
+  }
+  // Snapshot-only sessions (DSH 0.1.5-rc.3, react/spec) behave identically.
+  const snapshotSession = { snapshotEvents: () => events }
+  assert.equal(reactSessionMode(snapshotSession), 'weak')
+  assert.equal(specSessionMode(snapshotSession), 'weak')
+})
+
 // ── promotion ──────────────────────────────────────────────────────────────
 
 test('standard preset: after the first tool/call the router keeps the full surface + stage state (v0.9)', async () => {
@@ -194,6 +315,118 @@ test('standard preset: after the first tool/call the router keeps the full surfa
   assert.deepEqual(assembled.contexts, [])
   assert.ok(assembled.tools.length === TOOLS.length, 'full tool catalog exposed')
   assert.match(assembled.sections.find((s) => s.name === 'persona').text, /^You are a helpful software engineer assistant\.$/)
+})
+
+test('all shipped router personas declare the required DSH prefix config', () => {
+  for (const preset of ['router-standard', 'router-react', 'router-spec']) {
+    const yaml = readFileSync(new URL(`./${preset}/agent.cordis.yml`, import.meta.url), 'utf8')
+    assert.match(yaml, /name: '@deepseek-ai\/dsh-persona'\s+config:\s+prefix:/, preset)
+  }
+})
+
+/** Locate an installed @deepseek-ai/dsh-persona row, if this machine has one. */
+function locateDshPersona() {
+  const candidates = []
+  if (process.env.DSH_PERSONA_PLUGIN) candidates.push(process.env.DSH_PERSONA_PLUGIN)
+  if (process.env.DSH_CHECKOUT) candidates.push(join(process.env.DSH_CHECKOUT, 'packages', 'dsh-persona'))
+  const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf8' })
+  if (npmRoot.status === 0 && npmRoot.stdout.trim()) {
+    const root = npmRoot.stdout.trim()
+    candidates.push(join(root, '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-persona'))
+    candidates.push(join(root, '@deepseek-ai', 'dsh-persona'))
+  }
+  return candidates.find((dir) => existsSync(join(dir, 'package.json')) && existsSync(join(dir, 'lib', 'index.js')))
+}
+
+/** Parse a preset manifest, accepting both a bare plugin sequence and { plugins: [] }. */
+function manifestRows(parser, text) {
+  // DSH's loader understands the `!!js` tag; plain YAML parsing warns about it.
+  const doc = parser.parse(text, { logLevel: 'silent' })
+  if (Array.isArray(doc)) return doc
+  return Array.isArray(doc?.plugins) ? doc.plugins : []
+}
+
+test('shipped persona rows satisfy the installed DSH persona schema', async (t) => {
+  const personaDir = locateDshPersona()
+  if (!personaDir) {
+    t.skip('no installed @deepseek-ai/dsh-persona found; set DSH_PERSONA_PLUGIN to enable this check')
+    return
+  }
+  const require = createRequire(join(personaDir, 'package.json'))
+  let YAML
+  try {
+    YAML = await import(pathToFileURL(require.resolve('yaml')))
+  } catch {
+    t.skip('yaml parser not resolvable from the DSH install')
+    return
+  }
+  const { Config } = await import(pathToFileURL(join(personaDir, 'lib', 'index.js')))
+  t.diagnostic(`validating against ${personaDir}`)
+  for (const preset of ['router-standard', 'router-react', 'router-spec']) {
+    const text = readFileSync(new URL(`./${preset}/agent.cordis.yml`, import.meta.url), 'utf8')
+    const row = manifestRows(YAML, text).find((entry) => entry?.name === '@deepseek-ai/dsh-persona')
+    assert.ok(row, `${preset} has a dsh-persona row`)
+    // Throws "$.prefix missing required value" on the legacy text-only shape.
+    const config = Config(row.config)
+    assert.equal(typeof config.prefix, 'string', `${preset} persona prefix is a string`)
+    assert.ok(config.prefix.trim().length > 0, `${preset} persona prefix is not empty`)
+  }
+  // Negative control: the shape this suite replaced must stay invalid.
+  assert.throws(() => Config({ text: 'legacy' }), /prefix/)
+})
+
+test('DSH persona prefix replaces only prefix and preserves suffix after promotion', async () => {
+  const sections = [
+    { name: 'deployment:persona-prefix', order: 0, text: 'old prefix' },
+    { name: 'deployment:persona-suffix', order: 10200, text: 'Keep the runtime suffix.' },
+    { name: 'plan-mode', order: 100, text: 'Plan boundary.' },
+  ]
+  for (const applyPersona of [applyStandardPersona, applyReactPersona, applySpecPersona]) {
+    const result = applyPersona(sections, 'new prefix')
+    assert.equal(result.find((s) => s.name === 'router-persona').text, 'new prefix')
+    assert.equal(result.find((s) => s.name === 'deployment:persona-suffix').text, 'Keep the runtime suffix.')
+    assert.ok(result.some((s) => s.name === 'plan-mode'))
+  }
+  const h = makeHarness(applyStandard, {})
+  const session = makeSession([{ type: 'tool/call', data: { name: 'phase_begin' } }])
+  const agent = { session, options: { model: 'deepseek-v4-flash' } }
+  h.agentRef.current = agent
+  const assembled = await h.assemble({ ...baseAssembled(), sections }, { agent, scope: agent })
+  assert.match(assembled.sections.find((s) => s.name === 'deployment:persona-prefix').text, /^You are a helpful software engineer assistant/)
+  assert.equal(assembled.sections.find((s) => s.name === 'deployment:persona-suffix').text, 'Keep the runtime suffix.')
+})
+
+test('goal shim deferred notice carries identified DSH user message', async () => {
+  const h = makeHarness(applyStandard, {})
+  const goal = { id: 'goal-1', revision: 1, objective: 'Finish safely', roundsStarted: 3 }
+  const session = makeSession([
+    { type: 'turn/start' },
+    { type: 'user/message', data: { id: 'goal-round', role: 'user', source: { kind: 'goal', goalId: goal.id, revision: goal.revision, round: goal.roundsStarted }, content: [] } },
+    { type: 'tool/call', data: { name: 'phase_begin' } },
+  ])
+  const agent = { id: 'agent-1', status: 'running', session, ctx: { get(name) { return name === 'tools' ? h.ctx.tools : undefined } } }
+  h.agentRef.current = agent
+  h.ctx.tools.schemas = () => []
+  h.ctx.tools.view = () => ({ visible: new Map(), restrictableNames: new Set() })
+  const goals = { get: () => goal, complete: () => goal, block: () => goal }
+  const agents = { get: () => agent, currentInitiator: () => agent }
+  h.ctx.get = (name) => ({ agent, agents, goals })[name]
+  await h.assemble(baseAssembled(), { agent, scope: agent })
+  const update = h.registeredTools.findLast((t) => t.name === 'update_goal')
+  assert.ok(update, 'goal shim installed')
+  const deferred = []
+  await update.execute({ action: 'complete', goal_id: goal.id, revision: goal.revision }, { agent, deferContext(message) { deferred.push(message) } })
+  assert.equal(deferred.length, 1)
+  assert.ok(deferred[0].id, 'message identity required for replay')
+  assert.equal(deferred[0].source.form, 'notice')
+  assert.ok(deferred[0].source.summary)
+})
+
+test('react/spec presets use current snapshotEvents when legacy session.events is absent', () => {
+  const events = [{ type: 'tool/call', data: { name: 'read' } }]
+  const session = { snapshotEvents: () => events }
+  assert.deepEqual(reactEvents(session), events)
+  assert.deepEqual(specEvents(session), events)
 })
 
 test('v1.18: catalog default = current tier only; query/all whitebox; help marks unlock stage', async () => {
@@ -271,7 +504,8 @@ test('v1.18.1: phase_advance groups New this stage vs Pre-unlocked', async () =>
   const out = String(await adv.execute({}))
   assert.match(out, /advanced to phase 1/)
   assert.match(out, /New this stage: todo_write/)
-  assert.match(out, /New this stage:.*engram_open/)
+  // #128：阶段 1 解锁的是两个真实存在的规划工具（engram_* 幽灵名已移除）。
+  assert.match(out, /New this stage: todo_write \| exit_plan_mode/)
   assert.ok(!out.includes('Pre-unlocked'), 'v1.20: no pre-unlock group in the advance card')
   assert.match(out, /Next goal: 拟合方案/, 'advance card states the next goal')
   assert.ok(out.includes('\n'), 'card content on its own line')
@@ -573,4 +807,201 @@ test('v0.9: final phase releases the restrict (no new restriction)', async () =>
   await advance.execute({ reason: 'to 3' })
   // 阶段 0/1/2 各设一次 restrict；阶段 3 释放（不再新增）
   assert.equal(agent._restrictCalls.length, 3, 'stage 3 must not install another restriction')
+})
+
+// ── t4 适配：#99/#92 + #110/#125 + #137 + #69 ────────────────────────────────
+
+// #99（吸收 PR#99）：阶段解锁保留 own-scope shadow（has/get/data.has 三形状 ×3）。
+for (const registryShape of ['has', 'get', 'data.has']) {
+  test(`stage unlock preserves own-scope shadows and fills missing tools (${registryShape})`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'router-shadow-'))
+    const previousHome = process.env.DSH_HOME
+    const previousStageFile = process.env.DSH_ROUTER_STAGE_FILE
+    process.env.DSH_HOME = dir
+    process.env.DSH_ROUTER_STAGE_FILE = join(dir, 'stages.json')
+    t.after(() => {
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+      if (previousStageFile === undefined) delete process.env.DSH_ROUTER_STAGE_FILE
+      else process.env.DSH_ROUTER_STAGE_FILE = previousStageFile
+      rmSync(dir, { recursive: true, force: true })
+    })
+
+    const h = makeHarness(applyStandard, {})
+    const session = makeSession()
+    const shadows = ['edit', 'write', 'bash', 'pwsh'].map((name) => ({
+      name,
+      description: `Plugin ${name}`,
+      parameters: name === 'edit'
+        ? { type: 'object', properties: { path: { type: 'string' }, edits: { type: 'array', items: { type: 'string' } } }, required: ['path', 'edits'] }
+        : { type: 'object', properties: { custom_input: { type: 'string' } }, required: ['custom_input'] },
+      execute: async (args) => ({ plugin: name, args }),
+    }))
+    const originalSchemas = shadows.map((def) => structuredClone(def.parameters))
+    const own = new Map(shadows.map((def) => [def.name, def]))
+    const deletions = []
+    // 只暴露一种查询接口；保留 data.delete 复现 #92 路径。
+    const ownRegistry = { data: { delete(name) { deletions.push(name); return own.delete(name) } } }
+    if (registryShape === 'data.has') ownRegistry.data.has = (name) => own.has(name)
+    else ownRegistry[registryShape] = (name) => own[registryShape](name)
+    const hostTool = (name) => ({ name, description: `Host ${name}`, parameters: { type: 'object' }, execute: async () => `host:${name}` })
+    const mount = new Map(['edit', 'write', 'bash', 'pwsh', 'str_replace_editor'].map((name) => [name, hostTool(name)]))
+    const parent = new Map(['str_replace_editor', 'read_image'].map((name) => [name, hostTool(name)]))
+    const registrations = []
+    const restrictions = []
+    let releases = 0
+    const toolsSvc = {
+      layers: {
+        scoped: new Map(),
+        chainLayers(scope) {
+          if (scope === agent) return [{ tools: mount }]
+          if (scope === agent.ctx) return [{ tools: { entries: () => parent.entries() } }]
+          return []
+        },
+      },
+      register(def) {
+        registrations.push(def.name)
+        if (own.has(def.name)) throw new Error(`Duplicate tool: ${def.name}`)
+        own.set(def.name, def)
+      },
+      schemas: () => [...own.values()],
+      restrict(config) { restrictions.push(config); return () => { releases += 1 } },
+    }
+    const agent = { session, ctx: { get: (name) => name === 'tools' ? toolsSvc : undefined } }
+    toolsSvc.layers.scoped.set(agent, { tools: ownRegistry })
+    h.agentRef.current = agent
+    await h.assemble(baseAssembled(), { agent, scope: agent })
+    await h.registeredTools.find((def) => def.name === 'phase_begin').execute()
+
+    // 经真实 pre-step 处理器驱动自动推进。
+    for (const stage of [1, 2]) {
+      session.events.push({ type: 'tool/call', data: { name: 'todo_write' } })
+      await h.preStep({ agent, messages: [], turn: stage, step: 1 })
+      assert.equal(JSON.parse(readFileSync(process.env.DSH_ROUTER_STAGE_FILE, 'utf8')).sessions[session.id].stage, stage)
+      for (const [index, def] of shadows.entries()) {
+        assert.strictEqual(own.get(def.name), def, `${def.name} definition survives stage ${stage}`)
+        assert.strictEqual(own.get(def.name).parameters, def.parameters)
+        assert.deepEqual(own.get(def.name).parameters, originalSchemas[index])
+      }
+      assert.equal(own.has('str_replace_editor'), stage === 2, 'missing development tool unlocks only at stage 2')
+      assert.equal(own.has('read_image'), false, 'missing verification tool stays locked')
+    }
+    const args = { path: 'example.txt', edits: ['1#HASH|updated'] }
+    assert.deepEqual(await own.get('edit').execute(args), { plugin: 'edit', args })
+    assert.strictEqual(own.get('str_replace_editor'), mount.get('str_replace_editor'))
+
+    // own-layer 的 meta 工具仍可推进并在阶段 3 重装 shim。
+    assert.match(await own.get('phase_advance').execute({ reason: 'self-check passed' }), /advanced to phase 3/)
+    assert.strictEqual(own.get('read_image'), parent.get('read_image'), 'missing tool resolves through the context scope and entries fallback')
+    assert.equal(await own.get('read_image').execute(), 'host:read_image')
+    for (const def of shadows) {
+      assert.strictEqual(own.get(def.name), def, `${def.name} survives verification too`)
+      assert.ok(!deletions.includes(def.name), `${def.name} is never deleted`)
+      assert.ok(!registrations.includes(def.name), `${def.name} is never re-registered`)
+    }
+    assert.equal(registrations.filter((name) => name === 'str_replace_editor').length, 1, 'unlocked tool is not replaced by later layers or stages')
+    assert.equal(registrations.filter((name) => name === 'read_image').length, 1)
+    assert.equal(restrictions.length, 3, 'stages 0/1/2 install restrictions')
+    assert.ok(!restrictions[1].allow.includes('str_replace_editor'))
+    assert.ok(restrictions[2].allow.includes('str_replace_editor'))
+    assert.equal(releases, 3, 'stage 3 releases the last restriction')
+    assert.match(await own.get('dev_router_status').execute(), /\(3\/3\)/)
+  })
+}
+
+// #110/#125（行为面）：snapshotEvents-only 会话（0.1.5-rc.3 形状，无 legacy .events）驱动
+// memoryMuted/firstUserTask，且 muted 阶段文本不再含 memory/engram 引导。
+test('#110/#125: snapshotEvents-only session drives memoryMuted/firstUserTask; muted stage text drops memory guidance', async () => {
+  const file = tmpStageFile()
+  process.env.DSH_ROUTER_STAGE_FILE = file
+  const h = makeHarness(applyStandard, {})
+  const session = makeSession()
+  delete session.events // 0.1.5 形状：无 legacy 数组——读取必须走 snapshotEvents()
+  session.snapshotEvents = () => [
+    { type: 'user/message', data: userMessage('m1', '不用记忆。帮我从零开发一个马里奥网页游戏，生成完整实现') },
+    { type: 'tool/call', data: { name: 'read' } }, // promoted 分支（渲染 router-stage 常驻段）
+  ]
+  writeFileSync(file, JSON.stringify({ version: 2, sessions: { [session.id]: { stage: 0, guided: true, stageAtTime: Date.now() } } }))
+  const agent = { session, options: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } }
+  h.agentRef.current = agent
+  h.emit('agent/inbox/claimed', { agent, message: userMessage('m1', '不用记忆。帮我从零开发一个马里奥网页游戏，生成完整实现') })
+  const assembled = await h.assemble(baseAssembled(), { agent, scope: agent })
+  const stageSection = assembled.sections.find((s) => s.name === 'router-stage')
+  assert.ok(stageSection, 'stage section present')
+  const text = stageSection.text
+  assert.match(text, /memory disabled by user/, 'muted state is announced')
+  assert.ok(!/engram|mnemon/.test(text), 'muted output mentions no memory tool family (was silently broken on rc.3)')
+  assert.ok(!/ \+ memory/.test(text), 'muted output drops the memory unlock phrases')
+  assert.ok(!/Ground first: recall/.test(text), 'muted output drops the recall-first rule')
+  assert.match(text, /Task: 不用记忆/, 'firstUserTask echoes the task via snapshotEvents()')
+})
+
+// #137（吸收 PR#137）：consumed 水位两条 tripwire。
+test('watermark regression: persisted consumed survives reload — consumed history does not re-advance', async () => {
+  const file = tmpStageFile()
+  const sid = 'reload-session'
+  writeFileSync(file, JSON.stringify({ version: 2, sessions: { [sid]: { stage: 2, guided: true, consumed: 5, stageAtTime: Date.now() } } }))
+  process.env.DSH_ROUTER_STAGE_FILE = file
+  const h = makeHarness(applyStandard, {})
+  // 无时间戳事件：若 consumed 在加载时被丢弃（回退时间过滤），无时间戳事件恒计入 → delivery_check 重算 → 跳级
+  const session = { id: sid, header: {}, events: [
+    { type: 'user/message', data: userMessage('h1', '任务') },
+    { type: 'tool/call', data: { name: 'delivery_check' } },
+    { type: 'user/message', data: userMessage('h2', '继续') },
+    { type: 'tool/call', data: { name: 'todo_write' } },
+    { type: 'user/message', data: userMessage('h3', '继续2') },
+    { type: 'user/message', data: userMessage('h4', '继续3') },
+  ] }
+  const agent = makeStageAgent(session, [])
+  h.agentRef.current = agent
+  await h.preStep({ agent, messages: [userMessage('r', '继续')], turn: 9, step: 1 })
+  const disk = JSON.parse(readFileSync(file, 'utf8'))
+  assert.equal(disk.sessions[sid].stage, 2, 'history before the persisted consumed watermark must not re-advance after reload')
+})
+
+test('watermark regression: manual phase_advance consumes the signal window — stale delivery_check cannot jump stages', async () => {
+  const file = tmpStageFile()
+  process.env.DSH_ROUTER_STAGE_FILE = file
+  const h = makeHarness(applyStandard, {})
+  const session = makeSession()
+  const agent = makeStageAgent(session, [])
+  h.agentRef.current = agent
+  h.ctx.tools.view = () => ({ knownNames: [], visible: new Map(), restrictableNames: [] })
+  h.ctx.tools.schemas = () => []
+  await h.assemble(baseAssembled(), { agent, scope: agent }) // 填充 agents Map
+  // 阶段 0 时调用过 delivery_check（非 0→1 完成信号，滞留窗口）
+  session.events.push({ type: 'tool/call', data: { name: 'delivery_check' } })
+  const pa = h.registeredTools.find((t) => t.name === 'phase_advance')
+  await pa.execute({ reason: 'manual' })
+  await pa.execute({ reason: 'manual' })
+  await h.preStep({ agent, messages: [userMessage('m', '继续')], turn: 3, step: 1 })
+  const disk = JSON.parse(readFileSync(file, 'utf8'))
+  assert.equal(disk.sessions[session.id].stage, 2, 'stale pre-advance delivery_check must not trigger 2→3')
+})
+
+// #69：fork（分支）会话继承父阶段；委派子会话保持全量豁免（见上方 delegated child 测试）。
+test('#69: fork conversation inherits the parent stage and keeps routing; consumed watermarked at seed length', async () => {
+  const file = tmpStageFile()
+  process.env.DSH_ROUTER_STAGE_FILE = file
+  writeFileSync(file, JSON.stringify({ version: 2, sessions: { 'parent-A': { stage: 2, guided: true, consumed: 3, stageAtTime: Date.now() } } }))
+  const h = makeHarness(applyStandard, {})
+  const session = makeSession([
+    { type: 'user/message', data: userMessage('s1', '父会话历史任务') },
+    { type: 'tool/call', data: { name: 'delivery_check' } }, // 种子里的历史信号——继承后不得重复计入
+  ])
+  session.header.parentSession = 'parent-A' // 无 origin / delegationDepth === fork（分支会话）
+  const agent = makeStageAgent(session, [])
+  h.agentRef.current = agent
+  h.emit('agent/inbox/claimed', { agent, message: userMessage('f1', '继续上次的工作') })
+  let disk = JSON.parse(readFileSync(file, 'utf8'))
+  assert.equal(disk.sessions[session.id].stage, 2, 'fork inherits the parent stage at claim')
+  assert.equal(disk.sessions[session.id].consumed, session.events.length, 'watermark = child seed length (parent history not re-counted)')
+  const assembled = await h.assemble(baseAssembled(), { agent, scope: agent })
+  const stageSection = assembled.sections.find((s) => s.name === 'router-stage')
+  assert.match(stageSection.text, /Current phase: 开发 \(2\/3\)/, 'stage text renders the inherited stage')
+  // 继承后的 fork 会话正常参与推进（delivery_check → 3）。
+  session.events.push({ type: 'tool/call', data: { name: 'delivery_check' } })
+  await h.preStep({ agent, messages: [userMessage('r', '交付自检')], turn: 2, step: 1 })
+  disk = JSON.parse(readFileSync(file, 'utf8'))
+  assert.equal(disk.sessions[session.id].stage, 3, 'inherited stage continues to advance on new signals')
 })

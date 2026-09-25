@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
-import { writeFileSync, rmSync } from 'node:fs'
+import { writeFileSync, rmSync, readFileSync } from 'node:fs'
 import {
   classifyTask, personaFor, coreFor, bandFor, testinessFor, parseMode, applyPersona,
   isFlashModel, extractText, sessionMode,
@@ -264,8 +264,13 @@ test('runtimeCallable: 与 SDK 绑定同源（v1.11）', () => {
 })
 test('v1.16: muteAwareList/isMemoryTool + external evidence', async () => {
   assert.ok(isMemoryTool('engram_recall'))
+  // #128：现行记忆工具在部分部署由 dsh-mnemon 提供（mnemon_*）——必须同样命中
+  // 「禁用记忆→剔除」，否则剔除逻辑对现行工具名恒不生效。
+  assert.ok(isMemoryTool('mnemon_recall'))
+  assert.ok(isMemoryTool('mnemon_remember'))
   assert.ok(!isMemoryTool('read'))
-  const all = ['read', 'write', 'engram_recall', 'tool-help']
+  assert.ok(!isMemoryTool('dev_router_status'), '不得把宿主 dev_* 误判为记忆工具')
+  const all = ['read', 'write', 'engram_recall', 'mnemon_recall', 'tool-help']
   assert.deepEqual(muteAwareList(all, true), ['read', 'write', 'tool-help'])
   assert.deepEqual(muteAwareList(all, false), all)
   // external 证据：Playwright 产物合法（target 文件 + reviewed）
@@ -278,4 +283,14 @@ test('v1.16: muteAwareList/isMemoryTool + external evidence', async () => {
     })
     assert.equal(okr.ok, true)
   } finally { rmSync(tmp, { force: true }) }
+})
+
+test('#128: 阶段表/安全表不残留不存在的 engram_* 幽灵工具名', () => {
+  // 本机部署的记忆提供方（@openviking/dsh-memory-plugin）注册的是 openvikingMemory
+  // 服务，不存在 engram_*/mnemon_* 工具行。把幽灵名写进 STAGES/GLOBAL_SAFE 只会被
+  // restrict 的 known 过滤静默摘除（行为中性）却让阶段表宣称依赖不存在的工具。
+  // 正确修法是移除，而非把 mnemon_* 写进 GLOBAL_SAFE（那会反过来门控宿主记忆工具）。
+  const src = readFileSync(join(process.cwd(), 'router-standard', 'router-bootstrap-v34.mjs'), 'utf8')
+  const ghostLiterals = src.match(/'engram_[a-z]+'/g) ?? []
+  assert.deepEqual(ghostLiterals, [], '工具表里不应再有 engram_* 字面量：' + ghostLiterals.join(', '))
 })

@@ -27,7 +27,7 @@ check('staged-sdk-called', src.includes('const staged = buildStagedSdk(sections,
 check('no-stageSection-leak', !src.includes('(stageSection?.text'))
 check('tools-catalog-registered', src.includes("    name: 'tools_catalog',"))
 check('tools-help-registered', src.includes("    name: 'tools_help',"))
-check('dsh-home-stage-file', src.includes("process.env.DSH_HOME || homedir()"))
+check('dsh-home-stage-file', src.includes("process.env.DSH_HOME || join(homedir(), '.dsh')") && !src.includes('process.env.DSH_HOME || homedir()'))
 
 // 3. 配置指向新一代（?v= 预期递增）
 check('config-points-v34', /router-bootstrap-v34\.mjs\?v=\d+/.test(cfg))
@@ -130,3 +130,19 @@ check('v19-no-stale-code-mode-contract', !src.includes('Code Mode 契约') && !s
 
 if (fails.length) { console.error('SELFTEST FAIL:', fails.join(' | ')); process.exit(1) }
 console.log('SELFTEST PASS')
+// 13. t4 适配（#125 / PR#110 吸收）：muted replace 模式必须锚定现行 STAGE_GUIDES 文本
+// （旧模式对现行文本逐条零匹配 → muted 输出照旧提及 memory/engram——issue #125 主诉）；
+// 且 sessionFresh/memoryMuted/firstUserTask/markStageConsumed 必须走 sessionEvents()
+// 双兼容读法（裸 session.events 在 0.1.5-rc.3 恒 undefined，静默失效）。
+{
+  const guidesBody = src.slice(src.indexOf('const STAGE_GUIDES = ['), src.indexOf(']', src.indexOf('const STAGE_GUIDES = [')))
+  check('muted-pattern-stage0', guidesBody.includes('+ memory recall/verify/respond') && src.includes('/ \\+ memory recall\\/verify\\/respond/'))
+  check('muted-pattern-ground-first', guidesBody.includes('Ground first: recall → verify → read/ask.') && src.includes('Ground first: recall → verify → read\\/ask'))
+  check('muted-pattern-review', guidesBody.includes('+ memory review (search/open)') && src.includes('/ \\+ memory review \\(search\\/open\\)/'))
+  check('muted-pattern-write', guidesBody.includes('+ memory write (store/link)') && src.includes('/ \\+ memory write \\(store\\/link\\)/'))
+  check('muted-pattern-into-memory', guidesBody.includes('into memory instead') && src.includes("/into memory instead/"))
+  check('no-legacy-muted-patterns', !src.includes('engram_recall\\/verify\\/respond'))
+  check('session-events-migrated', src.includes('sessionEvents(agent?.session)') && src.includes('const events = sessionEvents(session)') && src.includes('const events = sessionEvents(session)\n  if (events.length) st.consumed = events.length') && !/for \(const e of agent\?\.session\?\.events/.test(src))
+  check('fork-delegation-split', src.includes('export function isDelegatedSession(') && src.includes('export function isForkSession(') && src.includes('maybeInheritForkStage('))
+  check('stage-unlock-preserves-shadow', src.includes('own-layer lookup unavailable') && !src.includes('data?.delete?.(name) } catch { /* ignore */ }\n              toolsSvc.register(def)'))
+}

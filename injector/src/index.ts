@@ -27,7 +27,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync, cpSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -52,7 +52,7 @@ cd "$ROOT"
 # DSH_CHECKOUT 探测：环境变量 → 常见路径（home 下 dsh-harness）
 CHECKOUT="\${DSH_CHECKOUT:-}"
 if [ -z "$CHECKOUT" ]; then
-  for candidate in "\$HOME/dsh-harness" "\$HOME/dsh" "\$HOME/.dsh/dsh-harness"; do
+  for candidate in "\$HOME/deepseek-harness" "\$HOME/dsh-harness" "\$HOME/dsh" "\$HOME/.dsh/dsh-harness"; do
     if [ -d "\$candidate/packages" ]; then CHECKOUT="\$candidate"; break; fi
   done
 fi
@@ -194,7 +194,10 @@ export function apply(ctx: Context, config: Config): void {
   // ctx.on('system-prompt/assemble', async (_assembly: unknown, context: any, next: () => Promise<any>) => {
   //   const assembled = await next()
   //   const agent = context.agent
-  //   if (!agent || agent.session.events.some((e: any) => e.type === 'tool/call')) return assembled
+  //   // DSH >= 0.1.2/0.1.5（PR#137 注释更新）：Session.events → snapshotEvents() 双兼容读取；
+  //   // 0.1.5-rc.3 已无公开 events 数组，裸 session.events 恒 undefined（静默失效）。
+  //   const evts: any[] = agent?.session?.snapshotEvents ? agent.session.snapshotEvents() : (agent?.session?.events || [])
+  //   if (!agent || evts.some((e: any) => e.type === 'tool/call')) return assembled
   //   const MINE = new Set(['${pkgName.replace(/[^a-z0-9_]/gi, '_')}_hello'])
   //   const CORE = '<核心工具>'
   //   return { ...assembled, tools: assembled.tools.filter((t: any) => !MINE.has(t.name) || t.name === CORE) }
@@ -441,7 +444,7 @@ function scaffoldPackageJson(pkgName: string, description: string, form: string)
   const peerDeps: Record<string, string> = {
     '@deepseek-ai/dsh-llm': '>=0.0.1-rc <2',
     '@deepseek-ai/dsh-tools': '>=0.0.1-rc <2',
-    'cordis': '>=4.0.0-rc <5',
+    '@deepseek-ai/cordis': '>=4.0.0-rc <5',
     '@deepseek-ai/schemastery': '^3.18.2',
   }
   if (withClient) {
@@ -501,6 +504,13 @@ export interface Config {
   profileNodeModules: string
   /** 启动时自动恢复清单中的注入。 */
   autoRestore: boolean
+  /** 三组件自装配（PR#114 feat 有条件采纳）：激活后把包内捆绑的 preset/ 复制到
+   * $DSH_HOME/.agent-presets（仅缺失项，不覆盖用户改动）。 */
+  provisionPresets: boolean
+  /** 三组件自装配：激活后把包内捆绑的 graded/ 装配进 profile（link: 依赖 + bundles +
+   * junction + 热装配，幂等）。默认 **false**——graded 是 0.0.1-rc1 实验组件，自动写
+   * profile dependencies/bundles 属重行为，应显式开启。 */
+  provisionGraded: boolean
   /** 轮询间隔（ms）。构建产物整批写入，间隔轮询天然合并抖动。 */
   intervalMs: number
   /** 监听目录 → 缓存匹配子串（loadCache key 是 realpath，用目录名匹配）。 */
@@ -514,6 +524,8 @@ export const Config = z.object({
   registryFile: z.string().default(''),
   profileNodeModules: z.string().default(''),
   autoRestore: z.boolean().default(true),
+  provisionPresets: z.boolean().default(true),
+  provisionGraded: z.boolean().default(false), // PR#114 修改点：实验组件不默认自装配（t3 裁决）
   intervalMs: z.number().default(1500),
   watches: z.array(z.object({
     dir: z.string().required(),
@@ -738,14 +750,18 @@ export function apply(ctx: AppContext, config: Config): void {
       const appendIds = [...appendText.matchAll(/^\s*- id:\s*([^\s#]+)/gm)].map((m) => m[1])
       // 2. 提取现有内容里所有条目块（含注释），按 id 归组
       const blocks = extractPatchBlocks(content)
-      const existing = new Set<string>()
+      // #126 修复（与注释对齐）：同 id 重复保留**最后一条**（后续同名覆盖先前的）。
+      // 旧实现 `if (existing.has(b.id)) continue` 实为「先见者留」，方向与注释相反——
+      // 旧条目先入 kept，新条目被丢弃，导致 append 携带的最新语义永远写不进去。
+      const lastIndexOfId = new Map<string, number>()
+      // F1（t5 复测 §6/§8）：strict tsc TS2345——同一索引访问不收窄会被推断为两次独立
+      // `string | undefined` 读取；单行收窄为局部 const（t5 已在 /tmp 副本验证 tsc 全绿）。
+      for (let i = 0; i < blocks.length; i++) { const bid = blocks[i].id; if (bid) lastIndexOfId.set(bid, i) }
+      const existing = new Set(lastIndexOfId.keys())
       const kept: string[] = []
-      for (const b of blocks) {
-        if (b.id) {
-          // 同 id 重复：只保留最后一条（后续同名覆盖先前的）
-          if (existing.has(b.id)) continue
-          existing.add(b.id)
-        }
+      for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i]
+        if (b.id && lastIndexOfId.get(b.id) !== i) continue // 同 id 有更靠后的条目 → 丢弃当前（留末条）
         kept.push(b.text)
       }
       // 3. 幂等：appendIds 全部已存在 → 不写入
@@ -793,6 +809,39 @@ export function apply(ctx: AppContext, config: Config): void {
     }
     if (current) blocks.push(current)
     return blocks
+  }
+
+  /** #126：profile patch 是否已有**精确 id** 的条目（解析式判定，非裸子串）。
+   * 旧实现 `includes('id: ' + idShort)` 是裸子串——`test-plugin` 会误命中
+   * `id: test-plugin-v2` 等更长 id，幂等判定假阳性（该卸的 disabled 写不进去）。 */
+  function patchEntryPresent(text: string, id: string): boolean {
+    if (!id) return false
+    const esc = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return new RegExp(`^\\s*- id:\\s*${esc}\\s*(#.*)?$`, 'm').test(text)
+  }
+
+  /** #126：注入成功后清掉 profile patch 里该插件的 disabled 条目（重装恢复可加载）。
+   * uninject 会为阻断 bundle patch 自装配写入 disabled 覆盖；若重装不清除，
+   * include.refresh 会继续按 disabled 优先把 entry 压住——插件装回来却加载不了。 */
+  function clearDisabledEntry(pkgName: string): boolean {
+    try {
+      const patchFile = join(dirname(profileNodeModules), 'cordis.patch.yml')
+      const idShort = pkgName.split('/').pop() ?? ''
+      if (!idShort) return false
+      let content = ''
+      try { content = readFileSync(patchFile, 'utf8') } catch { return false }
+      const blocks = extractPatchBlocks(content)
+      const kept: string[] = []
+      let removed = false
+      for (const b of blocks) {
+        if (b.id === idShort && /disabled:\s*true/.test(b.text)) { removed = true; continue }
+        kept.push(b.text)
+      }
+      if (!removed) return false
+      const cleaned = kept.join('').replace(/^\s*\[\]\s*$/m, '')
+      writeFileSync(patchFile, cleaned.trimStart() === '' ? '[]\n' : cleaned, 'utf8')
+      return true
+    } catch { return false }
   }
 
   /**
@@ -1964,6 +2013,11 @@ export function apply(ctx: AppContext, config: Config): void {
     }
     // 清 disabled（幽灵 entry 隔离）：注入即完整生效（host + client UI）
     normalizeEntriesByName(pkgName)
+    // #126：注入成功即清除 profile patch 的 disabled 条目——否则重装后 bundle patch
+    // 的自装配 disabled 覆盖仍然优先，插件看似装回实际加载不了。
+    if (clearDisabledEntry(pkgName)) {
+      try { auditLog('reinject-clean', `${pkgName} disabled 覆盖已清除（重装恢复可加载）`) } catch { /* 审计失败不阻塞 */ }
+    }
     // client 模块补扫（loader.create 的 microtask flush 在 normalize 前已跑）
     refreshClientRow(pkgName)
 
@@ -2008,10 +2062,12 @@ export function apply(ctx: AppContext, config: Config): void {
       const idShort = fullName.split('/').pop()
       if (idShort) {
         // ⚠️ 幂等：已存在同名 disabled 条目则跳过（否则重复卸载会累积条目——
-        // 实测踩坑：自检多次卸载累积 6 个 self-test-plugin disabled）
+        // 实测踩坑：自检多次卸载累积 6 个 self-test-plugin disabled）。
+        // #126：判定改解析式精确 id 匹配（裸子串 includes 会把 test-plugin 误命中
+        // test-plugin-v2 的条目，幂等假阳性）。
         const patchFile = join(dirname(profileNodeModules), 'cordis.patch.yml')
         let already = false
-        try { already = readFileSync(patchFile, 'utf8').includes(`id: ${idShort}`) } catch { /* 文件不存在 */ }
+        try { already = patchEntryPresent(readFileSync(patchFile, 'utf8'), idShort) } catch { /* 文件不存在 */ }
         if (already) {
           steps.push('profile patch 已有 disabled（幂等跳过）')
         } else if (writePatch(`\n# 已卸载插件（${fullName}）：disabled 阻断其 bundle patch 自装配\n- id: ${idShort}\n  disabled: true\n`)) {
@@ -2083,10 +2139,67 @@ export function apply(ctx: AppContext, config: Config): void {
    * ⚠️ slot 白名单（2026-08-14 dsh-external-plugins 事件教训）：注册的 slot 名
    * 必须位于已知合法集合内——早期只认 conversation.view，导致 settings.plugin.item
    * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。 */
-  const KNOWN_SLOTS = ['conversation.view', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.general.item', 'conversation.session.header.actions', 'conversation.session.header.utilities', 'conversation.input.dock', 'conversation.composer.dock', 'sidebar.footer.action', 'shell.overlay']
-  const SLOT_ALT = KNOWN_SLOTS.map((s) => s.replace(/\./g, '\\.')).join('|')
-  const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`)
+  /** slot 白名单（#127 同步校准）：对齐本机 DSH 0.1.5-rc.3 的官方声明面
+   * （dsh-client-ui-* 里 renderSlot()/slots.inject() 出现的全部 slot key）——
+   * 原表 11 项漏了 tool.call.toolview / settings.header / sidebar.* 等真实 slot，
+   * 会让健康插件被误判为坏骨架（PR#118 的 agi-harness 事件同因）。 */
+  const KNOWN_SLOTS = [
+    // F2（t5 复测重校，对齐本机 DSH 0.1.5-rc.3 实际 slot 集）：
+    //  - 补 9 个真实 slot：chat.turnTail / hero.agentPreset / hero.workspace.directoryFlow /
+    //    sidebar.workspaces.directoryFlow / settings.models.provider-card（renderSlot 声明面，
+    //    dsh-client-ui-settings-models）/ chat.assistant-actions / sidebar.right.pane.tab(.title) /
+    //    sidebar.right.tab.guide；
+    //  - 删 6 个 rc.3 不存在的陈旧名：chat.assistant / chat.turn / hero.agent /
+    //    hero.workspace.directory / settings.models.provider / sidebar.workspaces.directory
+    //    （rc.3 只有 -actions / -tail / -card / -Flow 后缀变体）。
+    // 口径固化：test/fixtures/actual-slots-rc3.txt（t5 实测提取）+ test/injector-known-slots.test.mjs。
+    'conversation.view',
+    'conversation.approval.detail', 'conversation.chat.assistant-actions', 'conversation.chat.commandview', 'conversation.chat.node', 'conversation.chat.turnTail',
+    'conversation.composer', 'conversation.composer.bar', 'conversation.composer.dock',
+    'conversation.hero.agentPreset', 'conversation.hero.brand.mark', 'conversation.hero.workspace', 'conversation.hero.workspace.directoryFlow',
+    'conversation.input.attachments', 'conversation.input.dock', 'conversation.input.left', 'conversation.input.model', 'conversation.input.overlay', 'conversation.input.plan', 'conversation.input.right',
+    'conversation.message.images', 'conversation.session', 'conversation.session.header', 'conversation.session.header.actions', 'conversation.session.header.corner', 'conversation.session.header.lineage', 'conversation.session.header.utilities',
+    'conversation.trajectory.images',
+    'main', 'main.conversation', 'rightbar', 'rightbar.session', 'root',
+    'settings.action', 'settings.close', 'settings.general.item', 'settings.header', 'settings.models.footer', 'settings.models.provider-card', 'settings.onboarding', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.trigger',
+    'shell.overlay',
+    'sidebar', 'sidebar.brand.mark', 'sidebar.brand.name', 'sidebar.footer.action', 'sidebar.panellist', 'sidebar.right.pane.tab', 'sidebar.right.pane.tab.title', 'sidebar.right.tab.document', 'sidebar.right.tab.guide', 'sidebar.right.tab.menu.item', 'sidebar.settings', 'sidebar.workspaces', 'sidebar.workspaces.directoryFlow',
+    'tool.call.images', 'tool.call.toolview', 'tool.view.cordis',
+  ]
+  const KNOWN_SLOT_SET = new Set<string>(KNOWN_SLOTS)
 
+  /** #127 修复：slot 注册的合法性改**逐调用**判定——统计 `slots.register({`
+   * 调用点并逐个核对 name 是否在已知集合，替代旧的跨条目正则 REGISTER_NAME
+   * （`register\\(\\{[\\s\\S]*?name:` 用 [\\s\\S] 跨越不同 register 调用，只要文件
+   * 里任何位置出现一个合法 slot 名就整文件通过——known+unknown、unknown+known
+   * 两种顺序均假阴性，#127 评论里 PerryLink 独立复现成立）。 */
+  function unknownSlotRegisters(text: string): number {
+    let unknown = 0
+    const callRe = /\bslots\s*\.\s*register\s*\(\s*\{/g
+    let m: RegExpExecArray | null
+    while ((m = callRe.exec(text)) !== null) {
+      // 浅层取该调用对象的 name 属性（name 在官方/常规用法里位于对象头部；
+      // 截到第一个 '}' 为止，避免吞进后续无关代码）
+      const shallow = text.slice(m.index + m[0].length, m.index + m[0].length + 600).split('}')[0]
+      const nameMatch = /\bname\s*:\s*['"]([^'"]+)['"]/.exec(shallow)
+      if (!nameMatch || !KNOWN_SLOT_SET.has(nameMatch[1])) unknown += 1
+    }
+    return unknown
+  }
+
+  /** PR#118（采纳原文）：client 是否真的使用 slots 服务——声明 inject 含 slots /
+   * 调 slots.register / 读 ctx.slots。三者皆无 = 非 slot 式 UI（路由式面板、纯占位
+   * client 等），slots 注入契约不适用，跳过骨架校验（历史上两类合法 client 被
+   * 误判为坏骨架而阻断注入）。 */
+  const usesSlots = (text: string): boolean =>
+    /inject\s*[=:]\s*\[[^\]]*['"]slots['"]/.test(text)
+    || /\bslots\s*\.\s*register\s*\(/.test(text)
+    || /\bctx\s*\.\s*slots/.test(text)
+
+  /** 骨架校验（**阻断级**）：只含注入后必崩的形状问题（缺 inject 声明）。
+   * F2（t5 复测）：unknown slot 告警从此处**拆出**——白名单天然滞后于宿主演进，
+   * 用真实 rc.3 slot（如 turnTail）的合法插件曾被并入 block 列表而注入被拒；
+   * 未知 slot 名改走 clientUnknownSlotProblems() 的**警告**通道（audit 留痕，不阻断）。 */
   function clientSkeletonProblems(base: string): string[] {
     const problems: string[] = []
     try {
@@ -2095,26 +2208,50 @@ export function apply(ctx: AppContext, config: Config): void {
       const libClient = join(base, 'lib', 'client.js')
       if (existsSync(libClient)) {
         const lib = readFileSync(libClient, 'utf8')
-        if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
-          problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
-        }
-        if (!REGISTER_NAME.test(lib)) {
-          problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
+        if (usesSlots(lib)) {
+          if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
+            problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
+          }
         }
       }
       // 2. 源码骨架（有 src 时）
       const clientSrcPath = join(base, 'src', 'client', 'index.ts')
       if (existsSync(clientSrcPath)) {
         const src = readFileSync(clientSrcPath, 'utf8')
-        if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
-          problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
-        }
-        if (!REGISTER_NAME.test(src)) {
-          problems.push(`slots.register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
+        if (usesSlots(src)) {
+          if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
+            problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
+          }
         }
       }
     } catch { /* 读不到文件时跳过 */ }
     return problems
+  }
+
+  /** F2：unknown slot 注册 → **警告**（不阻断）。白名单外的新 slot 名大概率是宿主
+   * 新版本新增（KNOWN_SLOTS 滞后），把告警并入 block 会让合法插件注入被拒；反之
+   * 真 typo 也只是"slot undefined is not declared"的运行时局部报错，不至崩 harness。 */
+  function clientUnknownSlotProblems(base: string): string[] {
+    const warns: string[] = []
+    try {
+      const libClient = join(base, 'lib', 'client.js')
+      if (existsSync(libClient)) {
+        const lib = readFileSync(libClient, 'utf8')
+        const unknown = unknownSlotRegisters(lib)
+        if (unknown > 0) {
+          warns.push(`lib/client.js 的 register 存在未知 slot name ×${unknown}（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
+        }
+      }
+      const clientSrcPath = join(base, 'src', 'client', 'index.ts')
+      if (existsSync(clientSrcPath)) {
+        const src = readFileSync(clientSrcPath, 'utf8')
+        const unknown = unknownSlotRegisters(src)
+        if (unknown > 0) {
+          warns.push(`slots.register 存在未知 slot name ×${unknown}（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
+        }
+      }
+    } catch { /* 读不到文件时跳过 */ }
+    return warns
   }
 
   /**
@@ -2281,6 +2418,12 @@ export function apply(ctx: AppContext, config: Config): void {
           logger.warn('[super-injector] 恢复 %s 跳过（client 骨架/构建产物问题）: %s', e.name, block.join('; '))
           continue
         }
+        // F2：未知 slot 名只警告（不阻断恢复）——白名单滞后不应卡合法插件。
+        const slotWarn = clientUnknownSlotProblems(e.dir)
+        if (slotWarn.length > 0) {
+          auditLog('restore-unknown-slots', `${e.name}: ${slotWarn.join('; ')}`)
+          logger.warn('[super-injector] 恢复 %s 存在未知 slot 注册（未阻断）: %s', e.name, slotWarn.join('; '))
+        }
         await inject(e.dir)
         logger.info('[super-injector] 自动恢复 %s', e.name)
       } catch (err) {
@@ -2424,6 +2567,12 @@ export function apply(ctx: AppContext, config: Config): void {
       if (block.length > 0) {
         return 'ERROR: 注入前校验发现 client 骨架/构建产物问题（已阻断——缺 inject 的 client 注入后 Tab 必挂，缺 client bundle 前端必挂）：\n- ' + block.join('\n- ')
           + '\n修复：参照脚手架模板补骨架 → npm run build:all（host + client 两步构建）→ 再注入'
+      }
+      // F2：未知 slot 名只警告（不阻断注入）——白名单滞后不应卡使用宿主新 slot 的合法插件。
+      const slotWarn = clientUnknownSlotProblems(resolve(dir))
+      if (slotWarn.length > 0) {
+        auditLog('inject-unknown-slots', `${dir}: ${slotWarn.join('; ')}`)
+        logger.warn('[super-injector] 注入 %s 存在未知 slot 注册（未阻断）: %s', dir, slotWarn.join('; '))
       }
       if (fresh.warn.length > 0) {
         auditLog('inject-stale-artifacts', `${dir}: ${fresh.warn.join('; ')}`)
@@ -2754,6 +2903,7 @@ export function apply(ctx: AppContext, config: Config): void {
     const env = (process.env as Record<string, string | undefined>).DSH_CHECKOUT
     if (env && existsSync(join(env, 'packages'))) return env
     const candidates = [
+      join(homedir(), 'deepseek-harness'),
       join(homedir(), 'dsh-harness'),
       join(homedir(), 'dsh'),
       join(homedir(), '.dsh', 'dsh-harness'),
@@ -3041,7 +3191,7 @@ export function apply(ctx: AppContext, config: Config): void {
         writeFileSync(join(tmpDir, 'package.json'), JSON.stringify({
           name: TEST_PKG, version: '0.0.1', private: true, type: 'module',
           main: './lib/index.js', files: ['lib'], license: 'BSD-3-Clause',
-          peerDependencies: { '@deepseek-ai/dsh-tools': '>=0.0.1-rc <2', 'cordis': '>=4.0.0-rc <5' },
+          peerDependencies: { '@deepseek-ai/dsh-tools': '>=0.0.1-rc <2', '@deepseek-ai/cordis': '>=4.0.0-rc <5' },
           devDependencies: { '@types/node': '^24.13.3', typescript: '^5.9.0' },
           scripts: { build: 'bash scripts/build.sh' },
         }, null, 2) + '\n', 'utf8')
@@ -3213,6 +3363,160 @@ export function apply(ctx: AppContext, config: Config): void {
     })
   } catch (e) {
     logger.warn('[super-injector] systemPrompt.context 重复注册容忍（跳过，新实例继续运行）: %s', e instanceof Error ? e.message : String(e))
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // 三组件自装配（PR#114 feat 有条件采纳，t3 裁决：provisionGraded 默认 false）：
+  // `dsh plugin add github:...` 只会装配 injector 本体（npm 按根 files 白名单打包）。
+  // 激活后在这里补齐 preset（provisionPresets 默认 true）；graded 走 link: 依赖 +
+  // bundles + junction + 热装配，默认关闭（0.0.1-rc1 实验组件，显式开启）。
+  // 全部幂等、失败不阻塞 boot。⚠️ 自装配的 preset 源是包内快照——发布面必须先含
+  // 修复版 yml，否则自动补装会把旧 text 形态的预设铺出去（复现 #101/#109）。
+  // ═══════════════════════════════════════════════════════════════════
+  /** 定位套装根（同时含 preset/ 与 graded/ 的那一层）。源码 checkout：
+   * injector/src → injector → 根；打包安装：injector/lib → injector → 包根。
+   * 从编译产物位置向上探测（最多 4 层），命中捆绑预设即返回。 */
+  function findSuiteRoot(): string | null {
+    let dir = dirname(fileURLToPath(import.meta.url))
+    for (let i = 0; i < 4; i++) {
+      dir = dirname(dir)
+      if (existsSync(join(dir, 'preset', 'router-standard', 'preset.yml'))) return dir
+    }
+    return null
+  }
+
+  function provisionPresets(suiteRoot: string): string[] {
+    const presetRoot = join(suiteRoot, 'preset')
+    const targetRoot = join(dshHome, '.agent-presets')
+    let names: string[]
+    try {
+      names = readdirSync(presetRoot, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && existsSync(join(presetRoot, e.name, 'preset.yml')))
+        .map((e) => e.name)
+    } catch (e) {
+      return [`presets: 捆绑预设目录不可读（跳过）: ${String(e)}`]
+    }
+    const notes: string[] = []
+    for (const name of names) {
+      const target = join(targetRoot, name)
+      if (existsSync(join(target, 'preset.yml'))) continue // 已有：不覆盖用户改动
+      try {
+        mkdirSync(targetRoot, { recursive: true })
+        cpSync(join(presetRoot, name), target, { recursive: true })
+        notes.push(`preset ${name} 已装配 → ${target}`)
+      } catch (e) {
+        notes.push(`preset ${name} 装配失败: ${String(e)}`)
+      }
+    }
+    return notes
+  }
+
+  async function provisionGraded(suiteRoot: string): Promise<string[]> {
+    const notes: string[] = []
+    const gradedDir = join(suiteRoot, 'graded')
+    const pkgPath = join(gradedDir, 'package.json')
+    if (!existsSync(pkgPath)) return ['graded: 包内无捆绑（跳过）']
+    let pkgName = ''
+    try {
+      pkgName = String(JSON.parse(readFileSync(pkgPath, 'utf8')).name ?? '')
+    } catch {
+      return ['graded: package.json 解析失败（跳过）']
+    }
+    if (!pkgName) return ['graded: package.json 缺 name（跳过）']
+
+    const profileDir = dirname(profileNodeModules)
+    const profilePkgPath = join(profileDir, 'package.json')
+    if (!existsSync(profilePkgPath)) return ['graded: profile package.json 不存在（跳过）']
+
+    // profile package.json（dependencies link: + bundles，幂等）：重启后由
+    // bundles 正常接管——与 dev_install_package 双路径一致。
+    try {
+      const profilePkg = JSON.parse(readFileSync(profilePkgPath, 'utf8')) as Record<string, any>
+      profilePkg.dependencies = profilePkg.dependencies ?? {}
+      profilePkg.dsh = profilePkg.dsh ?? {}
+      profilePkg.dsh.profile = profilePkg.dsh.profile ?? {}
+      profilePkg.dsh.profile.bundles = profilePkg.dsh.profile.bundles ?? []
+      const steps: string[] = []
+      if (!profilePkg.dependencies[pkgName]) {
+        profilePkg.dependencies[pkgName] = 'link:' + gradedDir
+        steps.push(`dependencies += ${pkgName}`)
+      }
+      if (!profilePkg.dsh.profile.bundles.includes(pkgName)) {
+        profilePkg.dsh.profile.bundles.push(pkgName)
+        steps.push(`bundles += ${pkgName}`)
+      }
+      if (steps.length) {
+        writeFileSync(profilePkgPath, JSON.stringify(profilePkg, null, 2) + '\n', 'utf8')
+        notes.push(`graded: profile package.json 已更新（${steps.join(', ')}）`)
+      }
+    } catch (e) {
+      return [...notes, `graded: profile package.json 更新失败: ${String(e)}`]
+    }
+
+    // node_modules junction（@scope/name 两级；悬空链接重建，lstat 判链接本体）
+    const parts = pkgName.startsWith('@') ? pkgName.split('/') : [pkgName]
+    const linkPath = join(profileNodeModules, ...parts)
+    try {
+      let linkOk = false
+      try { linkOk = existsSync(join(linkPath, 'package.json')) } catch { /* 悬空 */ }
+      if (!linkOk) {
+        try { rmSync(linkPath, { recursive: true, force: true }) } catch { /* 覆盖重建 */ }
+        mkdirSync(dirname(linkPath), { recursive: true })
+        symlinkSync(gradedDir, linkPath, 'junction')
+        notes.push(`graded: junction 已建立 → ${linkPath}`)
+      }
+    } catch (e) {
+      return [...notes, `graded: junction 失败: ${String(e)}`]
+    }
+
+    // loader 热装配（幂等：entry 已存在则跳过）
+    try {
+      let exists = false
+      for (const entry of ctx.loader.entries()) {
+        const opts = (entry as { options?: { name?: string } }).options
+        if (opts?.name === pkgName) { exists = true; break }
+      }
+      if (!exists) {
+        await ctx.loader.create({ name: pkgName, config: {} })
+        notes.push('graded: loader.create 已热装配（免重启生效）')
+      } else {
+        notes.push('graded: loader entry 已存在（跳过）')
+      }
+      normalizeEntriesByName(pkgName)
+      refreshClientRow(pkgName)
+    } catch (e) {
+      notes.push(`graded: 热装配失败（重启后由 bundles 接管）: ${String(e)}`)
+    }
+    return notes
+  }
+
+  const provisionPresetsOn = (config as { provisionPresets?: boolean }).provisionPresets !== false
+  const provisionGradedOn = (config as { provisionGraded?: boolean }).provisionGraded === true
+  if (provisionPresetsOn || provisionGradedOn) {
+    // 延迟执行：等 boot 尘埃落定（watch/autoRestore 之后）再补装，异步不阻塞装配
+    globalThis.setTimeout(() => {
+      void (async () => {
+        try {
+          const suiteRoot = findSuiteRoot()
+          if (!suiteRoot) {
+            auditLog('provision-skip', '未定位到套装根（preset/ 缺失）——本包可能是单独构建的 injector')
+            return
+          }
+          const notes: string[] = []
+          if (provisionPresetsOn) notes.push(...provisionPresets(suiteRoot))
+          if (provisionGradedOn) notes.push(...await provisionGraded(suiteRoot))
+          if (notes.length) {
+            for (const n of notes) logger.info('[super-injector] 自装配: %s', n)
+            auditLog('provision-ok', notes.join(' | '))
+          } else {
+            auditLog('provision-clean', '三组件已齐（无需补装）')
+          }
+        } catch (e) {
+          auditLog('provision-failed', String(e))
+          logger.warn('[super-injector] 自装配失败（不影响运行）: %s', e instanceof Error ? e.message : String(e))
+        }
+      })()
+    }, 1500)
   }
 
   logger.info('[super-injector] 就绪：watch %d 目录（%dms），autoRestore=%s', watches.length, intervalMs, String(config.autoRestore))

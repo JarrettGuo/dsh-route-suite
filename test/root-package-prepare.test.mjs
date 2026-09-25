@@ -1,12 +1,28 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+test('root, injector and scaffold peer names agree with scoped DSH packages', () => {
+  const root = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'))
+  const injector = JSON.parse(readFileSync(join(repoRoot, 'injector', 'package.json'), 'utf8'))
+  const lock = JSON.parse(readFileSync(join(repoRoot, 'injector', 'package-lock.json'), 'utf8'))
+  for (const pkg of [root, injector, lock.packages['']]) {
+    assert.ok(pkg.peerDependencies['@deepseek-ai/cordis'])
+    assert.ok(pkg.peerDependencies['@deepseek-ai/schemastery'])
+    assert.ok(!Object.hasOwn(pkg.peerDependencies, 'cordis'))
+    assert.ok(!Object.hasOwn(pkg.peerDependencies, 'schemastery'))
+  }
+  const source = readFileSync(join(repoRoot, 'injector', 'src', 'index.ts'), 'utf8')
+  assert.match(source, /peerDeps\['@deepseek-ai\/dsh-client-ui-slots'\]/)
+  assert.match(source, /'@deepseek-ai\/cordis': '>=4\.0\.0-rc <5'/)
+  assert.doesNotMatch(source, /'cordis': '>=4\.0\.0-rc <5'/)
+})
 
 test('the root package runs the injector prepare hook for git installs', () => {
   const fixture = mkdtempSync(join(tmpdir(), 'dsh-routing-suite-prepare-'))
@@ -41,7 +57,10 @@ test('the prepared injector entry points are included in the package', () => {
 
   try {
     mkdirSync(join(fixture, 'injector', 'lib'), { recursive: true })
+    mkdirSync(join(fixture, 'injector', 'scripts'), { recursive: true })
     copyFileSync(join(repoRoot, 'package.json'), join(fixture, 'package.json'))
+    copyFileSync(join(repoRoot, 'injector', 'package.json'), join(fixture, 'injector', 'package.json'))
+    copyFileSync(join(repoRoot, 'injector', 'scripts', 'prepare.mjs'), join(fixture, 'injector', 'scripts', 'prepare.mjs'))
     copyFileSync(join(repoRoot, 'injector', '.gitignore'), join(fixture, 'injector', '.gitignore'))
 
     const npmIgnore = join(repoRoot, 'injector', '.npmignore')
@@ -60,7 +79,12 @@ test('the prepared injector entry points are included in the package', () => {
     })
 
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
-    const paths = JSON.parse(result.stdout)[0].files.map(({ path }) => path)
+    // npm pack invokes prepare even with --ignore-scripts and prints its log before JSON.
+    const jsonStart = result.stdout.lastIndexOf('\n[')
+    assert.ok(jsonStart >= 0, `npm pack did not return JSON: ${result.stdout}`)
+    const paths = JSON.parse(result.stdout.slice(jsonStart + 1))[0].files.map(({ path }) => path)
+    assert.ok(paths.includes('injector/package.json'), 'package omits injector/package.json')
+    assert.ok(paths.includes('injector/scripts/prepare.mjs'), 'package omits injector/scripts/prepare.mjs')
     assert.ok(paths.includes('injector/lib/index.js'), 'package omits injector/lib/index.js')
     assert.ok(paths.includes('injector/lib/client.js'), 'package omits injector/lib/client.js')
   } finally {

@@ -18,15 +18,30 @@ const path = require('node:path')
 const { execSync } = require('node:child_process')
 
 const REQ = path.resolve(__dirname, '..') // preset 仓库根
-const P = path.join(REQ, 'preset')         // preset/preset 源码根
+// F4（t5 复测 §6）：仓库已扁平化（单仓库，无 submodule）——源码目录即 `<repo>/preset/<name>`，
+// 不再存在 submodule 时代的 `preset/preset/` 嵌套层（旧路径实测直接 die）。
+const P = REQ                             // preset 源码根（平铺布局）
 
 // DSH_HOME = dsh 的 .dsh 根目录。
-// 注意坑（本部署实测）：user shell 的 HOME/USERPROFILE 是 Administrator，
+// 注意坑（原作者部署实测）：user shell 的 HOME/USERPROFILE 是 Administrator，
 // 但真实 profile/agent-presets 在 Eldwen 用户下（dsh 进程 homedir=Administrator 却吃到 Eldwen）。
-// 所以：优先用 DSH_HOME 环境变量（dsh 启动器真实设置值），否则显式落到 Eldwen，
-// 绝不跟 USERPROFILE/HOME 走。
-const DSH_HOME = process.env.DSH_HOME || 'C:\\Users\\Eldwen'
-const AGENT = path.join(DSH_HOME, '.dsh', '.agent-presets')
+// #136 顺带（分诊衍生修复 7）：不再无条件写死 Eldwen；
+// F4（t5 复测 §6）：DSH_HOME 语义对齐本机 dsh-home-paths.resolveDshHome——
+//   **$DSH_HOME 即 .dsh 根**（dshHomePath('.agent-presets') = `$DSH_HOME/.agent-presets`），
+//   显式设置 DSH_HOME 的用户此前被多拼一层 `.dsh` 同步到错误位置（预设永远不被扫描）：
+//   1) $DSH_HOME 设了 → 直接 `<$DSH_HOME>/.agent-presets`（官方口径）；
+//   2) 否则原作者机器的 C:\Users\Eldwen\.dsh 存在 → 沿用其 .agent-presets（不破坏原部署）；
+//   3) 否则回退 `~/.dsh/.agent-presets`（dsh-home-paths 默认档）。
+const os = require('node:os')
+function resolveAgentPresetsDir() {
+  if (process.env.DSH_HOME) return path.join(process.env.DSH_HOME, '.agent-presets')
+  const legacy = 'C:\\Users\\Eldwen'
+  if (process.platform === 'win32' && fs.existsSync(path.join(legacy, '.dsh'))) {
+    return path.join(legacy, '.dsh', '.agent-presets')
+  }
+  return path.join(os.homedir(), '.dsh', '.agent-presets')
+}
+const AGENT = resolveAgentPresetsDir()
 
 // 三大预设：源码目录名 + 运行目录名 + 目标版本（从源码 agent.cordis.yml 反推）
 const PRESETS = {

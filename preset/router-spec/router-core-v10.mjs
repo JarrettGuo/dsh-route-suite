@@ -195,7 +195,7 @@ export function clamp01(v) {
  */
 export function applyPersona(sections, personaText) {
   const rest = (sections || []).filter(
-    (section) => section.name !== 'persona' && !/persona/i.test(section.name),
+    (section) => section.name !== 'persona' && section.name !== 'deployment:persona-prefix' && section.name !== 'router-persona',
   )
   return [...rest, { name: 'router-persona', text: personaText, order: 0 }]
 }

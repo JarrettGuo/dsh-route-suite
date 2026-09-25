@@ -22,6 +22,7 @@ import { homedir, tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, readdirSync, rmSync } from 'node:fs'
 import vm from 'node:vm'
+import { randomUUID } from 'node:crypto'
 
 export const name = 'router-bootstrap'
 export const inject = ['systemPrompt', 'tools', 'llm']
@@ -54,7 +55,8 @@ function toJsonSchema(spec) {
 }
 
 const RL_PERSONA = 'You are a helpful software engineer assistant.'
-const ROUTER_VERSION = 'v1.20.0'
+// F7（t5 复测）：版本戳与 CHANGELOG 对齐（CHANGELOG 先例 v1.17.1「版本戳统一」；此前 v1.21-v1.29 七个版本未回填）
+const ROUTER_VERSION = 'v1.29.0'
 /* 描述单源（v1.13 审计修复）：main 注册与 own-layer shim 读同一份，杜绝双份漂移。 */
 const DESC = {
   toolsCatalog: '渐进式披露一级：默认只列当前阶段可调工具（未解锁不点名、不预告后续工具）；query 单点白盒（命中未解锁才给相关行，带解锁阶段/交付期标注）；无全量出口——严格按阶段推进，未解锁工具名称不进入视野。行标注=运行时真绑定。',
@@ -75,15 +77,25 @@ const PRESSURE_GUIDE =
   '\n\nProactivity (replaces the pressure valve): every turn, before awaiting the user, scan for the next actionable item — unfinished work, unverified claims, reversible improvements, unfixed warnings. Choose one and act; report what you did and why. Ask only when the choice belongs to the user (preference, budget, irreversible/destructive, external approval). Two or more dependent steps: think step by step, but do not stop to ask permission for reversible work. Depth is our call: a small result gets a small thought, a consequential fork gets full reasoning.'
 const START_GUIDE =
   '\n\nBootstrap (once per session): this is a progressive tool-unlock session — tools open in phases like a leveling game. Call phase_begin to confirm start (unlock phase-0 tools; presentation stays native). A brand-new conversation auto-starts at phase 0 — no manual reset needed.'
-  + 'Unlock order: understanding (read/glob/grep/web_search/ask_user_question) → planning (todo_write) → development (write/edit/str_replace_editor) → verification (pwsh/read_image/jobs). '
+  + 'Unlock order: understanding (read/glob/grep/web_search/web_fetch/ask_user_question) → planning (todo_write) → development (write/edit/str_replace_editor) → verification (pwsh/read_image/jobs). '
   + 'This guide appears only once; after this, no phase messages are injected. '
   + 'Current phase + unlocked tools are always visible in the system prompt (router-stage section) and via dev_router_status. '
   + 'You route yourself: to advance, complete the current phase — alignment (ask_user_question / plan recorded) → planning (plan locked) → development (self-check) → verification (delivery_check) — or call phase_advance; tool usage alone never skips a stage.'
 
 const STAGES = [
-  { name: '了解/对齐', tools: ['read', 'glob', 'grep', 'web_search', 'ask_user_question', 'engram_recall', 'engram_verify', 'engram_respond'] },
-  { name: '拟合方案', tools: ['todo_write', 'exit_plan_mode', 'engram_search', 'engram_open'] },
-  { name: '开发', tools: ['write', 'edit', 'str_replace_editor', 'engram_store', 'engram_link'] },
+  // #128（吸收 PR#128）：原列的 engram_recall/verify/respond/search/open/store/link——
+  // engram_* 全组在本机部署并不存在（本机记忆提供方为 @openviking/dsh-memory-plugin，
+  // 注册的是 openvikingMemory 服务而非 engram_*/mnemon_* 工具）。它们唯一的效果是被
+  // restrict 的 known 过滤静默摘除（行为中性），却让阶段表宣称依赖不存在的工具。
+  // 移除即恢复声明的诚实性；宿主记忆能力（无论 engram_*/mnemon_*/openviking）不受
+  // 阶段门控影响，仍恒可调。
+  // #79（t2 分诊：A 类设计缺口）：web_fetch 补进阶段 0——web_search 找到来源后
+  // 需要真正打开页面取证；此前 web_fetch 不在任何档位、不在 GLOBAL_SAFE，模型
+  // 看得到搜索引导却调不了抓取（filterToolGuidance 按可见窗口裁剪说明段）。
+  // 宿主未注册 web_fetch 时由 known 过滤自然剔除（无害）。
+  { name: '了解/对齐', tools: ['read', 'glob', 'grep', 'web_search', 'web_fetch', 'ask_user_question'] },
+  { name: '拟合方案', tools: ['todo_write', 'exit_plan_mode'] },
+  { name: '开发', tools: ['write', 'edit', 'str_replace_editor'] },
   { name: '验证', tools: ['pwsh', 'bash', 'read_image', 'job_list', 'job_output', 'job_kill'] },
 ]
 // 平台事实（v1.12）：win32 已由 gitbash-shell 组提供真 Git Bash（isolate realm 私有 shell seam，
@@ -94,15 +106,16 @@ const STAGE_SAFE = STAGES.flatMap((s) => s.tools)
 const GLOBAL_SAFE = [
   ...STAGE_SAFE,
   'tools_catalog', 'tools_help', 'dev_router_status', 'phase_begin', 'phase_advance',
-  'engram_recall', 'engram_store', 'engram_propose', 'engram_confirm', 'engram_reject',
-  'engram_open', 'engram_search', 'engram_link', 'engram_update', 'engram_remove',
-  'engram_promote', 'engram_status', 'engram_verify', 'engram_respond',
-  'dev_reload_preset_live', 'delivery_check',
+  // #128：原列 12 个 engram_*（recall/store/propose/confirm/reject/open/search/link/
+  // update/remove/promote/status/verify/respond）全组不存在于部署的运行时——移除。
+  'dev_reload_preset_live', 'delivery_check', 'skill',
   'get_goal', 'create_goal', 'update_goal',
 ]
 
 const META_TOOLS = ['phase_advance', 'dev_router_status', 'tools_catalog', 'tools_help']
-const META_LIVE = [...META_TOOLS, 'dev_reload_preset_live', 'dev_page_check', 'phase_begin', 'delivery_check', 'dev_reset_experience']
+// #128：移除悬空的 dev_page_check——其工具定义已删（v1.23 起 delivery_check 不再复用
+// pageCheckRun），运行时注册表查无此工具，留在 META_LIVE 只会让 stageInfo 把它误判为 meta。
+const META_LIVE = [...META_TOOLS, 'dev_reload_preset_live', 'phase_begin', 'delivery_check', 'dev_reset_experience', 'skill']
 const META_GOAL = ['get_goal', 'create_goal', 'update_goal']
 const META_ALL = [...META_LIVE, ...META_GOAL]
 
@@ -117,8 +130,8 @@ export function windowFor(stage) { return Math.min(stage + 1, STAGES.length) }
  *  v1.5：caps 提示 / write-edit 只用 path / shell 真实语义 / dev_page_check。
  *  v1.6：预放两档 + 直达语义（写 HTML 直给任务零路由成本）；跨语言转义提醒。 */
 const STAGE_GUIDES = [
-  'Phase: understanding. Unlocked: this stage only — read/glob/grep/web_search/ask_user_question + memory recall/verify/respond. Ground first: recall → verify → read/ask. Do this stage properly and think broadly — do not settle on the first obvious reading. Break the request into its dimensions (what the user wants, how features should behave, what "good" looks like) and surface the genuinely ambiguous ones: a word like "拖拽" could mean reorder, drag-to-recategory, or both; "瀑布流" could mean masonry columns or JS-grid; persistence is often unspecified. **Decide each ambiguity by its impact:** if you can infer the common meaning and only one interpretation is reasonable for a deliverable, state that assumption clearly in one sentence (so the user can correct it) and continue — but if two or more interpretations would materially change the result (reorder vs recategory; persist vs not), ask ONE focused ask_user_question per such ambiguity, with concrete options. Do not under-ask (assume everything) nor over-ask (interrogate trivia) — aim for the questions that actually change the artifact. This is a deep-thinking stage: if the task is complex, also record a plan (todo_write). **Complete when: you understand the task (assumptions stated, or key ambiguities answered) — and, if complex, a plan is recorded. No alignment, no advancement.** → Done? Understood (stated assumption / question answered / plan recorded) → next stage.',
-  'Phase: planning. Unlocked: todo_write/exit_plan_mode + memory review (search/open). Do this stage properly: design the approach, cover edge cases, define what "done" means, and decide acceptance criteria — not just list steps. **Attention reclamation (v1.26): assetize your context — keep the task goal + the current decision + the live evidence in the attention window; sink settled exploration/details into memory (engram_store) instead of holding them all; let stale, superseded, or resolved threads truly drop (fresh context recovers attention). Do not hold "everything might be useful" in mind — that is attention leakage, not diligence.** **Isolation & parallel (pillar 4): when two independent concerns are polluting one thread, or a sub-problem is eating the mainline budget, push it into a subagent / workflow (independent context) instead of keeping it in the same stream — a focused subagent holds its own attention so your mainline stays on the critical path.** **Complete when: the plan is thorough enough that the design is decision-complete (what to build, how it fits, what success looks like), recorded via todo_write or presented via exit_plan_mode.** Only this lets you enter development. Note: a completion signal (todo_write / exit_plan_mode) AUTO-advances to the next phase — do NOT call phase_advance after it, or you will skip a phase. → Done? Plan is decision-complete and locked (todo_write / exit_plan_mode) → develop (auto).',
+  'Phase: understanding. Unlocked: this stage only — read/glob/grep/web_search/web_fetch/ask_user_question + memory recall/verify/respond. Ground first: recall → verify → read/ask. Knowledge-gap rule (#79): if the task needs facts beyond your own knowledge (specific APIs, current library docs, versions), treat that as a gap — run web_search and open the best source with web_fetch before planning; never guess API details you can verify. Do this stage properly and think broadly — do not settle on the first obvious reading. Break the request into its dimensions (what the user wants, how features should behave, what "good" looks like) and surface the genuinely ambiguous ones: a word like "拖拽" could mean reorder, drag-to-recategory, or both; "瀑布流" could mean masonry columns or JS-grid; persistence is often unspecified. **Decide each ambiguity by its impact:** if you can infer the common meaning and only one interpretation is reasonable for a deliverable, state that assumption clearly in one sentence (so the user can correct it) and continue — but if two or more interpretations would materially change the result (reorder vs recategory; persist vs not), ask ONE focused ask_user_question per such ambiguity, with concrete options. Do not under-ask (assume everything) nor over-ask (interrogate trivia) — aim for the questions that actually change the artifact. This is a deep-thinking stage: if the task is complex, also record a plan (todo_write). **Complete when: you understand the task (assumptions stated, or key ambiguities answered) — and, if complex, a plan is recorded. No alignment, no advancement.** → Done? Understood (stated assumption / question answered / plan recorded) → next stage.',
+  'Phase: planning. Unlocked: todo_write/exit_plan_mode + memory review (search/open). Do this stage properly: design the approach, cover edge cases, define what "done" means, and decide acceptance criteria — not just list steps. **Attention reclamation (v1.26): assetize your context — keep the task goal + the current decision + the live evidence in the attention window; sink settled exploration/details into memory instead of holding them all; let stale, superseded, or resolved threads truly drop (fresh context recovers attention). Do not hold "everything might be useful" in mind — that is attention leakage, not diligence.** **Isolation & parallel (pillar 4): when two independent concerns are polluting one thread, or a sub-problem is eating the mainline budget, push it into a subagent / workflow (independent context) instead of keeping it in the same stream — a focused subagent holds its own attention so your mainline stays on the critical path.** **Complete when: the plan is thorough enough that the design is decision-complete (what to build, how it fits, what success looks like), recorded via todo_write or presented via exit_plan_mode.** Only this lets you enter development. Note: a completion signal (todo_write / exit_plan_mode) AUTO-advances to the next phase — do NOT call phase_advance after it, or you will skip a phase. → Done? Plan is decision-complete and locked (todo_write / exit_plan_mode) → develop (auto).',
   'Phase: development. Unlocked: write/edit/str_replace_editor + memory write (store/link). Re-read before re-edit (editor enforces fresh read); write/edit results carry FULL before/after text — take path/operation, inspect with grep/read. Do this stage properly: make the artifact real, self-check it against the plan and the acceptance criteria, and do not declare it done until it actually passes its own check. **Avoid local-optima (v1.22): keep the WHOLE artifact working while you iterate. If you find yourself re-fighting the same detail for several rounds with no convergence (e.g. a finite-difference sign, a conservation drift), step back: (1) is this detail blocking the overall deliverable, or is it polish? (2) preserve a working version; iterate on the detail in parallel, not by stalling the whole. (3) if a detail resists, finish the rest and re-attack it fresh — do not let one stubborn sub-problem stall the deliverable.** **Complete when: the artifact exists and passes its self-check — then enter verification via delivery_check (completion signal) or phase_advance.** → Done? Self-check passes → delivery_check → verification.',
   'Phase: verification → delivery gate. Unlocked: pwsh/bash/read_image/jobs + delivery_check. Windows: bash = Git Bash (first-class), pwsh for PowerShell; Git Bash may need the one-shot sandbox escalation (approval=never: if denied, report it — never bypass). Page verify with your OWN tools: run a headless browser/playwright via bash (or install one), screenshot + read_image each shot (reviewed:true) to visually confirm. **On verification failure, hold a quick hypothesis-audit (guidance, not a hard block): before touching the implementation, name in one line (a) which assumption you are now re-checking, (b) what NEW evidence you just gained — this turns "doubt the hypothesis" from a prompt into a habit. If the code is actually correct, say so and move on (do not manufacture a bug to justify rework).** Then check gates/evidence. Do this stage properly: verify the real artifact, not a summary of it — check evidence, look for defects, review the visuals honestly. **Gate: delivery_check must PASS — evidence manifest required; missing evidence/unreviewed visuals = FAIL.**',
 ]
@@ -171,11 +184,15 @@ export function categorizeDomain(name, desc) {
   if (/(bash|pwsh|shell|run_code|exec|command|spawn)/i.test(t)) return 'exec'
   if (/(web|search|fetch|http|network|browse)/i.test(t)) return 'network'
   if (/(subagent|agent|delegate|workflow|ralph|fork)/i.test(t)) return 'delegate'
-  if (/(engram|memory|recall|store|search)/i.test(t)) return 'memory'
+  // #128：现行记忆工具可能由 dsh-mnemon 提供（mnemon_*）——域分类同步补 mnemon。
+  if (/(engram|mnemon|memory|recall|store|search)/i.test(t)) return 'memory'
   return 'other'
 }
-/** 记忆工具判定（v1.16：#4 用户禁用记忆 → 调用面+注入面双双剔除，不是只改引导句）。 */
-export function isMemoryTool(name) { return /^engram_/.test(String(name || '')) }
+/** 记忆工具判定（v1.16：#4 用户禁用记忆 → 调用面+注入面双双剔除，不是只改引导句）。
+ *  #128（吸收 PR#128）：原为 /^engram_/——现行记忆工具在部分部署由 dsh-mnemon 提供、
+ *  名为 mnemon_*，旧正则对它们恒 false，导致「用户禁用记忆」的剔除完全未执行。
+ *  现同时匹配 engram_（历史名）与 mnemon_（现行名）。 */
+export function isMemoryTool(name) { return /^(engram|mnemon)_/.test(String(name || '')) }
 export function muteAwareList(names, muted) {
   return muted ? (names || []).filter((n) => !isMemoryTool(n)) : names
 }
@@ -183,7 +200,10 @@ export function muteAwareList(names, muted) {
 /** 会话是否为新会话（DSH request/header reason=initial）——即使 session id 复用了旧阶段记录，也自动从 0 开始。 */
 export function sessionFresh(agent) {
   try {
-    for (const e of agent?.session?.events || []) {
+    // DSH >=0.1.5（#110 / PR#110 吸收）：Session 已无公开 events 数组——走 core 的
+    // sessionEvents() 双兼容读法（snapshotEvents() 优先、legacy 数组回退）。
+    // 裸 session.events 在 0.1.5-rc.3 下恒 undefined → 本函数此前恒 false（静默失效）。
+    for (const e of sessionEvents(agent?.session)) {
       if (e.type === 'request/header' && e.data?.reason === 'initial') return true
     }
   } catch { /* 无法判定时按旧会话处理 */ }
@@ -194,7 +214,8 @@ export function sessionFresh(agent) {
  *  检测会话用户消息中的记忆禁用意图；命中后阶段指引不再提 recall/verify/engram。 */
 export function memoryMuted(session) {
   try {
-    const events = session?.events || []
+    // #125 顺带修复：session?.events 在 0.1.5-rc.3 恒 undefined → 禁用记忆检测恒 false。
+    const events = sessionEvents(session)
     const re = /不用记忆|勿用记忆|禁用记忆|记忆系统.*(不用|不要|禁用)|不要用记忆|no memory|without memory/i
     for (const e of events) {
       if (e.type !== 'user/message') continue
@@ -207,7 +228,8 @@ export function memoryMuted(session) {
 /** 会话任务回显（v1.19.1 引导工程）：取第一条真实用户消息，让模型每轮都看清"我在为哪件事工作"。 */
 export function firstUserTask(session) {
   try {
-    for (const e of session?.events || []) {
+    // #125 顺带修复：同 memoryMuted——裸 session.events 在 rc.3 恒 undefined → 任务回显恒空。
+    for (const e of sessionEvents(session)) {
       if (e.type !== 'user/message') continue
       const src = e.data?.source ?? e.data?.message?.source
       if (src?.kind !== 'user') continue
@@ -227,11 +249,17 @@ function stageText(stage, runtimeList, muted, taskText = '') {
   const taskLine = taskText ? '\nTask: ' + taskText : ''
   let guide = STAGE_GUIDES[stage] || ''
   if (muted) {
+    // #125 修复：四个 replace 模式此前对现行 STAGE_GUIDES 文本逐条零匹配（模式写的是
+    // 旧版括号文本，现行文本是 "+ memory recall/verify/respond" 等无括号形态）——
+    // muted 输出照旧提及 memory/engram。模式改为锚定现行文本，并新增 guide1 的
+    // "into memory (engram_store)" 一处；selftest/integration 有「muted 输出不含
+    // memory/engram」断言守护。
     guide = guide
-      .replace(/ \+ memory \(engram_recall\/verify\/respond\)/, ' (memory disabled by user)')
-      .replace(/ \+ memory review \(engram_search\/open\)/, ' (memory disabled by user)')
-      .replace(/ \+ memory write \(engram_store\/link\)/, ' (memory disabled by user)')
-      .replace(/Ground first: recall, verify claims, then read\/ask for the rest\./, 'Ground first: read/ask for the rest (memory disabled by user).')
+      .replace(/ \+ memory recall\/verify\/respond/, ' (memory disabled by user)')
+      .replace(/Ground first: recall → verify → read\/ask\./, 'Ground first: read/ask for the rest (memory disabled by user).')
+      .replace(/ \+ memory review \(search\/open\)/, ' (memory disabled by user)')
+      .replace(/into memory instead/, 'into the task plan (todo_write) instead')
+      .replace(/ \+ memory write \(store\/link\)/, ' (memory disabled by user)')
   }
   if (stage >= STAGES.length - 1) {
     return 'Current phase: ' + s.name + ' (' + s.stage + '/3). Delivery: restrict released — full catalog open: ' + callable.join(', ')
@@ -560,8 +588,44 @@ function saveStageState() {
  *  下一步重复计入并再次跳级（v0.3.0 缺陷）。事件下标是身份，不是时钟。 */
 function markStageConsumed(st, session) {
   st.stageAtTime = Date.now()
-  const events = session?.events
-  if (Array.isArray(events)) st.consumed = events.length
+  // #125 顺带修复（PR#110 吸收）：裸 session?.events 在 0.1.5-rc.3 恒 undefined →
+  // consumed 水位永远不落盘，历史完成信号会被重复计入而跳级。
+  const events = sessionEvents(session)
+  if (events.length) st.consumed = events.length
+}
+
+/* ── #69：fork（「在新对话中分支」）vs 委派子会话的区分与阶段继承 ─────────────
+ * 本机 DSH 0.1.5-rc.3 读码（dsh-session/dsh-subagent）证实两种子会话共用
+ * header.parentSession 字段，但委派额外携带 origin:'subagent' + delegationDepth
+ * （dsh-subagent childSessionMeta），而 Session.fork() / api-session-controller 的
+ * 分支路径只设 parentSession + isSeeded、无 origin。据此区分：
+ *  - 委派子会话（origin==='subagent'）→ 全量豁免路由干预（#119 修复语义不变）；
+ *  - fork 会话（parentSession 有、origin 非 subagent）→ 正常参与路由，且首次出现时
+ *    从父会话复制阶段记录（继承 stage/consumed/guided），不再"从 0 重来"。 */
+export function isDelegatedSession(session) {
+  const h = session?.header
+  if (h?.parentSession === undefined) return false
+  return h.origin === 'subagent' || h.delegationDepth !== undefined
+}
+export function isForkSession(session) {
+  return session?.header?.parentSession !== undefined && !isDelegatedSession(session)
+}
+/** fork 会话首次出现时，从父会话记录复制阶段状态（consumed 以子会话当前事件数为水位——
+ *  父历史里的完成信号已推动父阶段、随阶段一起继承，不得重复计入而二次跳级）。 */
+function maybeInheritForkStage(session) {
+  try {
+    if (!isForkSession(session)) return
+    const sid = session?.id
+    const pid = session?.header?.parentSession
+    if (!sid || !pid || sid === pid) return
+    const state = ensureStage()
+    if (state[sid]) return
+    const parent = state[pid]
+    if (!parent || !Number.isInteger(parent.stage)) return
+    const events = sessionEvents(session)
+    state[sid] = { stage: parent.stage, guided: parent.guided === true, stageAtTime: Date.now(), ...(events.length ? { consumed: events.length } : {}) }
+    saveStageState()
+  } catch { /* 继承失败不阻塞路由（子会话按无记录=阶段 0 处理） */ }
 }
 
 /** restrict 交集修复：per-session disposer（释放旧再设新）。 */
@@ -571,6 +635,8 @@ const sharedLift = globalThis[Symbol.for('router-standard.restrictLift')] ?? (gl
 /** 跨代共享 override：main 注册与 own-layer shim 必须读写同一张表，否则 status 看不到 mode 覆盖。 */
 const overrideMap = () => globalThis[Symbol.for('router-standard.overrides')] ??= new Map()
 function applyStageRestrict(agent, stage) {
+  // #119/#69：仅委派子会话（origin==='subagent'）豁免门控；fork 会话正常参与。
+  if (isDelegatedSession(agent?.session)) return
   try {
     const sid = agent?.session?.id
     const prev = sid ? sharedLift.get(sid) : undefined
@@ -593,7 +659,7 @@ function applyStageRestrict(agent, stage) {
 }
 
 export function apply(ctx, config) {
-  try { mkdirSync(join(process.env.DSH_HOME || homedir(), 'router-standard'), { recursive: true }); writeFileSync(join(process.env.DSH_HOME || homedir(), 'router-standard', 'last-mount.txt'), 'new-gen v0.8 ' + new Date().toISOString(), 'utf8') } catch { /* marker */ }
+  try { mkdirSync(join(dshHomeForState(), 'router-standard'), { recursive: true }); writeFileSync(join(dshHomeForState(), 'router-standard', 'last-mount.txt'), 'new-gen v0.8 ' + new Date().toISOString(), 'utf8') } catch { /* marker */ }
   // 运行环境修整：① node 进 PATH（harness 的 node 在自定义运行时目录，不在系统 PATH——v1.5 实测
   // "node not recognized" 的根因）；② Git bin 前置（让 git 在任何 shell 都可用；bash 工具在 win32
   // 已禁用——host 的 shell seam 在 win32 只提供 pwsh，此前 bash 行在 win32 实为 pwsh 语义）。
@@ -609,7 +675,7 @@ export function apply(ctx, config) {
     // shell 解析诊断（v1.4.1→v1.5）：bash/node 实际解析到哪——事实文件，不再靠猜。
     try {
       const cands = fore.filter((e) => existsSync(join(e, process.platform === 'win32' ? 'bash.exe' : 'bash')))
-      writeFileSync(join(process.env.DSH_HOME || homedir(), 'router-standard', 'bash-diag.json'),
+      writeFileSync(join(dshHomeForState(), 'router-standard', 'bash-diag.json'),
         JSON.stringify({ at: new Date().toISOString(), win32: process.platform === 'win32', nodeDir, gitCandidates: cands, nodeOnPath: fore.some((e) => existsSync(join(e, 'node.exe'))) }, null, 2), 'utf8')
     } catch { /* 诊断失败不阻塞 */ }
   } catch { /* PATH 修整失败不阻塞 */ }
@@ -619,7 +685,9 @@ export function apply(ctx, config) {
   const shimmedSessions = new Set()
 
   ctx.on('agent/inbox/claimed', ({ agent, message }) => {
-    if (message?.source?.kind !== 'user') return
+    if (isDelegatedSession(agent?.session) || message?.source?.kind !== 'user') return
+    // #69：fork 会话在此继承父阶段记录（后续 assemble/pre-step 按继承后的阶段路由）。
+    try { maybeInheritForkStage(agent?.session) } catch { /* ignore */ }
     const text = extractText(message)
     if (!text.trim()) return
     const session = agent?.session
@@ -630,7 +698,9 @@ export function apply(ctx, config) {
     const assembled = await next()
     const agent = context.agent
     if (agent === undefined) return assembled
-    if (agent.session?.header?.parentSession !== undefined) return assembled
+    // #119/#69：仅委派子会话豁免 assemble 干预；fork 会话先继承父阶段再正常路由。
+    if (isDelegatedSession(agent.session)) return assembled
+    if (isForkSession(agent.session)) { try { maybeInheritForkStage(agent.session) } catch { /* ignore */ } }
     const session = agent.session
     agents.set(session.id, agent)
 
@@ -655,7 +725,7 @@ export function apply(ctx, config) {
     const toolsSvc = agent?.ctx?.get?.('tools')
     const fullNames = knownToolNames(toolsSvc, agent)
     const sections = filterToolGuidance((assembled.sections || []).map((s) =>
-      /persona/i.test(s.name) ? { ...s, text: RL_PERSONA } : s
+      (s.name === 'deployment:persona-prefix' || s.name === 'persona') ? { ...s, text: RL_PERSONA } : s
     ), stage, fullNames)
     // v1.18.1 口径统一：先安装 meta shim，再基于同一注册面渲染 stageText（与 dev_router_status 同源）
     if (!shimmedSessions.has(session.id)) {
@@ -678,7 +748,9 @@ export function apply(ctx, config) {
   // ── 自主路由（pre-step）：调用下一档工具 → 自动推进阶段 ──────────────────
   ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
     const decision = await next()
-    if (agent === undefined || agent.session === undefined) return decision
+    // #119/#69：仅委派子会话豁免 pre-step 推进；fork 会话先继承父阶段再参与推进。
+    if (agent === undefined || agent.session === undefined || isDelegatedSession(agent.session)) return decision
+    if (isForkSession(agent.session)) { try { maybeInheritForkStage(agent.session) } catch { /* ignore */ } }
     const userMsg = (messages || []).find((m) => m.role === 'user' && m.source?.kind === 'user')
     const text = userMsg ? extractText(userMsg) : ''
     const sid = agent.session.id
@@ -738,7 +810,9 @@ export function apply(ctx, config) {
       if (session === undefined) return 'no agent session'
       const sid = session.id
       const state = ensureStage()
-      const doFresh = sessionFresh(currentAgent())
+      // #69：fork 会话不按"新会话"重置——fork 的 seed 可能携带父会话的 request/header
+      // initial 事件，sessionFresh 会误判为全新会话并把继承的阶段抹回 0。
+      const doFresh = sessionFresh(currentAgent()) && !isForkSession(session)
       if (doFresh) {
         state[sid] = { stage: 0, guided: true }
         saveStageState()
@@ -940,6 +1014,9 @@ export function apply(ctx, config) {
   /** forwarding shim：注册到 target 的**自身 scope**（own layer 不受旧 restrict 相交过滤），
    *  让当前热重载会话立即看到 meta 工具。 */
   function installMetaShim(agent, opts) {
+    // #119/#69：仅委派子会话豁免 shim；fork 会话先继承父阶段再正常安装。
+    if (isDelegatedSession(agent?.session)) return 0
+    if (isForkSession(agent?.session)) { try { maybeInheritForkStage(agent?.session) } catch { /* ignore */ } }
     const installStage = opts?.installStage !== false
     const curStage = opts?.stage ?? (agent?.session?.id ? ensureStage()[agent.session.id]?.stage ?? 0 : 0)
     const toolsSvc = agent?.ctx?.get?.('tools')
@@ -1092,7 +1169,7 @@ export function apply(ctx, config) {
         const targetSid2 = shimArgs?.targetSessionId || target2.session?.id || sid
         const before2 = ap2.composedPreset(target2.ctx) ?? 'unknown'
         if (before2 === 'unknown') return 'ERROR: 未加入预设'
-        const ymlFile2 = join(process.env.DSH_HOME || homedir(), '.agent-presets', before2, 'agent.cordis.yml')
+        const ymlFile2 = join(dshHomeForState(), '.agent-presets', before2, 'agent.cordis.yml')
         let yml2 = ''
         try { yml2 = readFileSync(ymlFile2, 'utf8') } catch (e) { return 'ERROR: 读取失败 ' + String(e) }
         const refRe2 = /(name: \.\/[A-Za-z0-9._-]+\.mjs)(\?v=\d+)?/g
@@ -1163,7 +1240,7 @@ export function apply(ctx, config) {
           if (args.action === 'blocked' && authority.kind === 'goal-round' && authority.goal.roundsStarted < 3) throw new Error('blocked requires at least 3 consecutive goal rounds')
           const goal = args.action === 'complete' ? goalsSvc.complete(execution.agent, ref) : goalsSvc.block(execution.agent, ref, { code: 'model-reported', message: String(args.blocked_reason || '') })
           if (authority.kind === 'goal-round' && exec && typeof exec.deferContext === 'function') {
-            exec.deferContext({ role: 'user', source: { kind: 'plugin', plugin: 'tool-goal', form: 'notice' }, content: [{ type: 'text', text: args.action === 'complete' ? '<goal_complete>' : '<goal_blocked>' }] })
+            exec.deferContext({ id: randomUUID(), role: 'user', source: { kind: 'plugin', plugin: 'tool-goal', form: 'notice', summary: `${args.action}: ${String(goal.objective).slice(0, 100)}` }, content: [{ type: 'text', text: args.action === 'complete' ? '<goal_complete>' : '<goal_blocked>' }] })
           }
           return JSON.stringify(goalsValue(goal))
         }
@@ -1212,8 +1289,18 @@ export function apply(ctx, config) {
             try { for (const [nn, dd] of lt.entries()) if (nn === name) { def = dd; break } } catch { /* ignore */ }
           }
           if (def) {
+            // #92（PR#99 吸收）：阶段解锁只补缺失，不接管——先探测 own-layer 是否已有
+            // 同名定义（has/get/data.has 三形状），已有则跳过，保留插件自己注册的
+            // agent-scope shadow（如 dsh-better-edit）。旧代码先 scoped.delete(name)
+            // 再 register 内置版，会把解锁档位内插件的 own-scope 工具定义删掉。
             try {
-              try { toolsSvc?.layers?.scoped?.get?.(agent)?.tools?.data?.delete?.(name) } catch { /* ignore */ }
+              const own = toolsSvc?.layers?.scoped?.get?.(agent)?.tools
+              const hasOwn = typeof own?.has === 'function' ? own.has(name)
+                : typeof own?.get === 'function' ? !!own.get(name)
+                  : (own?.data?.has?.(name) ?? false)
+              if (hasOwn) { seen.add(name); continue }
+            } catch { /* own-layer lookup unavailable */ }
+            try {
               toolsSvc.register(def); n += 1; seen.add(name)
             } catch { /* duplicate/无效 */ }
           }
@@ -1241,7 +1328,7 @@ export function apply(ctx, config) {
       if (!ap || !agent) return 'ERROR: agentPresets/agent 不可用 (target=' + label + ')'
       const before = ap.composedPreset(agent.ctx) ?? 'unknown'
       if (before === 'unknown') return 'ERROR: 当前 agent 未加入预设'
-      const home = process.env.DSH_HOME || homedir()
+      const home = dshHomeForState()
       const presetDir = join(home, '.agent-presets', before)
       const ymlFile = join(presetDir, 'agent.cordis.yml')
       let yml = ''
