@@ -29,7 +29,17 @@
   ],
   "scripts": {
     "test": "node --test router.test.mjs router.integration.test.mjs",
-    "probe": "node probe/matrix.mjs"
+    "probe": "node probe/matrix.mjs",
+    "gen:bundle": "node scripts/gen-bundle-patch.mjs"
   },
-  "engines": { "node": ">=22" }
+  "engines": { "node": ">=22" },
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./bundle/router-standard.patch.yml",
+        "./bundle/router-spec.patch.yml",
+        "./bundle/router-react.patch.yml"
+      ]
+    }
+  }
 }
