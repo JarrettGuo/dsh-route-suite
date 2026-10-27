@@ -63,7 +63,7 @@ function userMsg(text) {
   return {
     id: 'graded-' + Date.now() + '-' + Math.floor(Math.random() * 1e6),
     role: 'user',
-    source: { kind: 'plugin', plugin: 'dsh-graded-mode' },
+    source: { kind: 'plugin:dsh-graded-mode' },
     content: [{ type: 'text', text }],
   }
 }
@@ -88,7 +88,7 @@ function scanMode(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
     if (!m || m.role !== 'user') continue // 只扫用户消息：模型自报不生效为改口
-    if (m.source && m.source.kind === 'plugin') continue // 跳过本插件注入消息
+    if (m.source && m.source.kind === 'plugin:dsh-graded-mode') continue // 跳过本插件注入消息
     let txt = ''
     for (const x of (m.content || [])) {
       if (x && typeof x === 'object' && x.type === 'text') txt += x.text || ''
@@ -465,7 +465,7 @@ export function apply(ctx, config) {
             clearPersisted(sid)
             offJustNow = true // 后处理注入"已关闭"提示（模型不能再以为还在分级模式）
           }
-          if (s.stage === 'off') { task = arg; break }
+          if (s.stage === 'off' && !['off', 'status'].includes(arg)) { task = arg; break }
         }
       }
       if (task !== null) setState(sid, trigger(state(sid), task))
@@ -475,7 +475,7 @@ export function apply(ctx, config) {
         for (let i = messages.length - 1; i >= 0; i--) {
           const m = messages[i]
           if (!m || m.role !== 'user') continue
-          if (m.source && m.source.kind === 'plugin') continue // 跳过本插件注入的 userMsg
+          if (m.source && m.source.kind === 'plugin:dsh-graded-mode') continue // 跳过本插件注入的 userMsg
           let txt2 = ''
           for (const x of (m?.content || [])) {
             if (x && typeof x === 'object' && x.type === 'text') txt2 += x.text || ''

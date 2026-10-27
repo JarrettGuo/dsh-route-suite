@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # dsh-routing-suite 一键安装（Linux/macOS；镜像 install.ps1）：装配注入器 + 安装预设 + 自检。
+# 预设：DSH >=0.2 以 bundle 装配 preset/（不再复制到 .agent-presets）。
 # 注入器装配：优先源码构建（npm prepare），失败自动回退官方 Release tgz（SUPER_INJECTOR_VERSION 覆盖版本，默认 0.3.3）。
 set -euo pipefail
 
@@ -7,11 +8,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # DSH_HOME 优先：部署环境 homedir 可能与 DSH_HOME 不一致，不能只靠 $HOME
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
-AGENT_PRESETS_DIR="$DSH_HOME/.agent-presets"
 INJECTOR_DIR="$ROOT/injector"
 # G5（t1 差距清单）：router-react 纳入安装链（此前修复做完却没有安装/验证路径）
 PRESET_NAMES=("router-standard" "router-spec" "router-react")
-# G6：FORCE=1 ./install.sh 覆盖已存在预设（默认跳过，防覆盖用户改动）
+# FORCE=1 ./install.sh：graded 已安装时也重新装配（拿到仓库内新版 tgz）
 FORCE="${FORCE:-0}"
 
 # 输出着色（非终端自动禁用）
@@ -106,40 +106,34 @@ else
 fi
 
 info '[2/4] 安装 router presets'
-mkdir -p "$AGENT_PRESETS_DIR"
-for name in "${PRESET_NAMES[@]}"; do
-  if [ ! -d "$ROOT/preset/$name" ]; then
-    err "仓库缺少预设源码：$ROOT/preset/$name（跳过）"
-    continue
-  fi
-  target="$AGENT_PRESETS_DIR/$name"
-  if [ -d "$target" ]; then
-    if [ "$FORCE" = "1" ]; then
-      warn "预设已存在：$target（FORCE=1 覆盖重装）"
-      rm -rf "$target"
-    else
-      warn "预设已存在：$target（如需覆盖：FORCE=1 ./install.sh）"
-      continue
-    fi
-  fi
-  # 平铺复制：agent-presets 只扫一级子目录，每个预设目录必须直接含 agent.cordis.yml
-  cp -R "$ROOT/preset/$name" "$target"
-  ok "预设已安装：$target"
-done
+# DSH >=0.2：agent-preset-registry 不再扫描 $DSH_HOME/.agent-presets/，预设由
+# preset/ 这个 bundle 包的 patch（preset/bundle/*.patch.yml）声明——装配 bundle 即可。
+PRESET_DIR="$ROOT/preset"
+if [ ! -f "$PRESET_DIR/package.json" ]; then
+  err "仓库缺少预设 bundle：$PRESET_DIR/package.json"
+elif command -v dsh >/dev/null 2>&1; then
+  dsh plugin --profile web add "$PRESET_DIR" || err '预设 bundle 装配失败（见上方输出）'
+else
+  npx '@deepseek-ai/dsh' plugin --profile web add "$PRESET_DIR" || err '预设 bundle 装配失败（见上方输出）'
+fi
 
-info '[3/4] 自检预设布局'
+info '[3/4] 自检预设 bundle'
 failed=0
 for name in "${PRESET_NAMES[@]}"; do
-  check="$AGENT_PRESETS_DIR/$name/agent.cordis.yml"
+  check="$PRESET_DIR/bundle/$name.patch.yml"
   if [ -f "$check" ]; then
-    ok "$name -> agent.cordis.yml 就位"
+    ok "$name -> bundle/$name.patch.yml 就位"
   else
-    err "$name 缺少 agent.cordis.yml（$check）——预设不会被 DSH 发现"
+    err "$name 缺少 bundle patch（$check）——请在 preset/ 下运行 npm run gen:bundle"
     failed=1
   fi
 done
+if ! grep -q '"dsh-router-standard"' "$DSH_HOME/profiles/web/package.json" 2>/dev/null; then
+  err 'profile web 的 package.json 未登记 dsh-router-standard bundle——预设不会被 DSH 发现'
+  failed=1
+fi
 if [ "$failed" -ne 0 ]; then
-  err '预设布局自检失败——请勿复制 preset 整目录（会多套一层），每个预设目录需直接含 agent.cordis.yml'
+  err '预设 bundle 自检失败'
 fi
 
 # graded（分级模式，实验组件；#114 同步）：仓库内预构建 tgz 直接装配；不激活零痕迹。
@@ -149,8 +143,8 @@ GRADED_TGZ="$ROOT/graded/dsh-external-dsh-graded-mode-0.0.1-rc1.tgz"
 GRADED_LINK="$DSH_HOME/profiles/web/node_modules/@dsh-external/dsh-graded-mode"
 if [ "${SKIP_GRADED:-0}" = "1" ]; then
   warn 'SKIP_GRADED=1——按 provisionGraded=false 口径跳过 graded（不写 profile；需要时手动 dsh plugin add）'
-elif [ -f "$GRADED_LINK/package.json" ]; then
-  ok "graded 已安装：$GRADED_LINK（跳过）"
+elif [ -f "$GRADED_LINK/package.json" ] && [ "$FORCE" != "1" ]; then
+  ok "graded 已安装：$GRADED_LINK（跳过；FORCE=1 重新装配）"
 elif [ -f "$GRADED_TGZ" ]; then
   if command -v dsh >/dev/null 2>&1; then
     dsh plugin --profile web add "$GRADED_TGZ" || warn 'graded 装配失败（可忽略，不影响 router 预设）'

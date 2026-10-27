@@ -7,19 +7,22 @@
 // source of truth) into such a row, writing `bundle/<preset>.patch.yml`.
 //
 // - Relative module names (`./x.mjs`) resolve against the PROFILE tree's
-//   baseUrl, not this package, so they are rewritten to absolute file URLs.
+//   baseUrl, not this package, so they are rewritten to package specifiers
+//   (`dsh-router-standard/<preset>/x.mjs`), resolved through the profile's
+//   node_modules — portable across machines, unlike absolute file URLs.
 // - `@deepseek-ai/dsh-workflow-worker-thread` was removed in DSH 0.2; it is
 //   replaced by `@deepseek-ai/dsh-workflow-ptc` as in the official standard preset.
 //
 // Usage: node scripts/gen-bundle-patch.mjs   (re-run after editing a preset)
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const PRESETS = ['router-standard', 'router-spec', 'router-react']
 const OUT = join(ROOT, 'bundle')
+const PKG = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).name
 
 // Best-effort validation with the loader's YAML dialect (js-yaml + !!js).
 function loadYaml() {
@@ -46,8 +49,8 @@ for (const id of PRESETS) {
   const dir = join(ROOT, id)
   let body = readFileSync(join(dir, 'agent.cordis.yml'), 'utf8')
 
-  body = body.replace(/^(\s*name:\s*)'?(\.\/[^'\s]+)'?\s*$/gm, (_, head, rel) =>
-    `${head}'${new URL(rel, pathToFileURL(dir + '/')).href}'`)
+  body = body.replace(/^(\s*name:\s*)'?\.\/([^'\s]+)'?\s*$/gm, (_, head, rel) =>
+    `${head}'${PKG}/${id}/${rel}'`)
   body = body.replace(
     /- id: workflow-worker-thread\n(\s*)name: '@deepseek-ai\/dsh-workflow-worker-thread'/,
     "- id: workflow-ptc\n$1name: '@deepseek-ai/dsh-workflow-ptc'")

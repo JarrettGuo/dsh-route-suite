@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — DSH 0.2.1-rc.4 适配
+
+在 0.2.1-rc.4 上逐项实测（真实会话 / 注入器自检）后修复：
+
+- **预设 bundle 可移植**：`gen-bundle-patch.mjs` 不再把 `./x.mjs` 改写为本机绝对 `file://`
+  路径，改为包说明符 `dsh-router-standard/<preset>/x.mjs`（经 profile node_modules 解析，`?v=N` 保留）。
+- **web_fetch 补回**：三个预设的 `tool-web` 由 `fetch: false` 改为 `fetch: true`（与官方 standard
+  预设一致）；此前阶段 0 白名单里的 `web_fetch`（#79）在会话中根本不存在。
+- **安装链**：install.sh / install.ps1 与注入器 `provisionPresets` 改为装配 `preset/` bundle，
+  不再复制到已失效的 `.agent-presets/`；根包 `files` 补 `preset/bundle`、`preset/package.json`。
+- **graded**：注入消息 source 迁移为 v4 producer-owned kind `plugin:dsh-graded-mode`（旧
+  `kind: 'plugin'` 被持久化层拒绝，`/graded` 触发后会话永久卡在 turn/start）；文本通道
+  `/graded status|off` 不再误触发一次以 "status"/"off" 为任务的分级流程。
+- **注入器**：自重载适配 loader 1.0.6（移除了 `entry._dispose`，按 dsh-hmr 的
+  `registry.delete` → 重新 `registry.plugin` 顺序替换）；`dev_self_test` 在无源码 checkout
+  的 npm 安装下跳过构建、使用预构建空插件；自检不再在用户 patch 尾部累积空行。
+
 ## v1.29.0 — DSH 0.1.5-rc.3 适配收口（sessionEvents 迁移 + fork 继承 + 幽灵名清理）
 
 > 版本戳：`ROUTER_VERSION` 已回填至本版（F7，t5 复测；CHANGELOG 先例 v1.17.1「版本戳统一」——

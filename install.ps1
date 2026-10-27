@@ -8,7 +8,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 # 的解析（显式配置 > $DSH_HOME > ~/.dsh）同口径。
 $envDshHome = $env:DSH_HOME
 if (-not $envDshHome) { $envDshHome = Join-Path $env:USERPROFILE '.dsh' }
-# G6：FORCE=1 覆盖已存在预设（默认跳过，防覆盖用户改动）
+# FORCE=1：graded 已安装时也重新装配（拿到仓库内新版 tgz）
 $force = ($env:FORCE -eq '1')
 
 Write-Host '=== [1/4] 装配注入器 ===' -ForegroundColor Cyan
@@ -45,42 +45,36 @@ if (Test-Path (Join-Path $injector 'lib\index.js')) {
 }
 
 Write-Host '=== [2/4] 安装 router presets ===' -ForegroundColor Cyan
+# DSH >=0.2：agent-preset-registry 不再扫描 $DSH_HOME\.agent-presets\，预设由
+# preset\ 这个 bundle 包的 patch（preset\bundle\*.patch.yml）声明——装配 bundle 即可。
 $presetRoot = Join-Path $root 'preset'
-# G5：router-react 纳入安装链（此前 react 修复做完却没有安装/验证路径）
 $presets = @('router-standard', 'router-spec', 'router-react')
-foreach ($name in $presets) {
-  $target = Join-Path $envDshHome (Join-Path '.agent-presets' $name)
-  if (Test-Path $target) {
-    if ($force) {
-      Write-Host "预设已存在：$target（FORCE=1 覆盖重装）" -ForegroundColor Yellow
-      Remove-Item -Recurse -Force $target
-    } else {
-      Write-Host "预设已存在：$target（如需覆盖：`$env:FORCE='1' 后重跑）" -ForegroundColor Yellow
-      continue
-    }
-  }
-  New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
-  # 平铺复制：DSH 的 agent-presets 发现只扫一级子目录，每个预设目录必须直接含 agent.cordis.yml
-  Copy-Item -Recurse (Join-Path $presetRoot $name) $target
-  Write-Host "预设已安装：$target" -ForegroundColor Green
+if ($dshCmd) {
+  & dsh plugin --profile web add $presetRoot 2>&1 | Out-Host
+} else {
+  & npx '@deepseek-ai/dsh' plugin --profile web add $presetRoot 2>&1 | Out-Host
 }
 
-# 自检：各预设一级目录必须直接含 agent.cordis.yml（防嵌套层级错误）
-Write-Host '=== 自检预设布局 ===' -ForegroundColor Cyan
+# 自检：bundle patch 就位 + profile 已登记 dsh-router-standard bundle
+Write-Host '=== 自检预设 bundle ===' -ForegroundColor Cyan
 foreach ($name in $presets) {
-  $check = Join-Path $envDshHome (Join-Path '.agent-presets' (Join-Path $name 'agent.cordis.yml'))
+  $check = Join-Path $presetRoot (Join-Path 'bundle' "$name.patch.yml")
   if (Test-Path $check) {
-    Write-Host "OK: $name -> agent.cordis.yml 就位" -ForegroundColor Green
+    Write-Host "OK: $name -> bundle\$name.patch.yml 就位" -ForegroundColor Green
   } else {
-    Write-Host "FAIL: $name 缺少 agent.cordis.yml（$check）——预设不会被 DSH 发现" -ForegroundColor Red
+    Write-Host "FAIL: $name 缺少 bundle patch（$check）——请在 preset\ 下运行 npm run gen:bundle" -ForegroundColor Red
   }
+}
+$profilePkg = Join-Path $envDshHome 'profiles\web\package.json'
+if (-not ((Test-Path $profilePkg) -and (Select-String -Path $profilePkg -Pattern '"dsh-router-standard"' -Quiet))) {
+  Write-Host 'FAIL: profile web 的 package.json 未登记 dsh-router-standard bundle——预设不会被 DSH 发现' -ForegroundColor Red
 }
 
 Write-Host '=== [3/4] 安装 graded（分级模式，实验组件）===' -ForegroundColor Cyan
 $gradedTgz = Join-Path $root 'graded\dsh-external-dsh-graded-mode-0.0.1-rc1.tgz'
 $gradedLink = Join-Path $envDshHome 'profiles\web\node_modules\@dsh-external\dsh-graded-mode'
-if (Test-Path (Join-Path $gradedLink 'package.json')) {
-  Write-Host "graded 已安装：$gradedLink（跳过）" -ForegroundColor Yellow
+if ((Test-Path (Join-Path $gradedLink 'package.json')) -and -not $force) {
+  Write-Host "graded 已安装：$gradedLink（跳过；`$env:FORCE='1' 重新装配）" -ForegroundColor Yellow
 } elseif (Test-Path $gradedTgz) {
   # 仓库内预构建发布物（lib/ 已入库），直接 tgz 装配；重启后由 bundles 接管
   if ($dshCmd) {

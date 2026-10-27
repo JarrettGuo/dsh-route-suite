@@ -41,16 +41,10 @@ Or manually:
 dsh plugin --profile web add .\injector
 # If dsh is not on PATH (npx @deepseek-ai/dsh web): npx '@deepseek-ai/dsh' plugin --profile web add .\injector
 
-# Step 2: install the router presets (one or all; DSH scans one level only,
-# so each preset directory must sit FLAT under .agent-presets)
-$target = Join-Path $env:DSH_HOME '.agent-presets\router-standard'
-Copy-Item -Recurse .\preset\router-standard $target
-
-$target = Join-Path $env:DSH_HOME '.agent-presets\router-spec'
-Copy-Item -Recurse .\preset\router-spec $target
-
-$target = Join-Path $env:DSH_HOME '.agent-presets\router-react'
-Copy-Item -Recurse .\preset\router-react $target
+# Step 2: install the router presets (DSH 0.2: preset\ is a bundle package; the
+# three presets are declared by its bundle\*.patch.yml — .agent-presets is no longer scanned)
+dsh plugin --profile web add .\preset
+# after editing preset\<name>\agent.cordis.yml: cd preset; npm run gen:bundle
 
 # Step 3 (optional): install graded mode (experimental; ships prebuilt in-repo;
 # activate with /分级 on — zero footprint while inactive)
@@ -59,10 +53,7 @@ dsh plugin --profile web add .\graded\dsh-external-dsh-graded-mode-0.0.1-rc1.tgz
 # Step 4: restart DSH → pick Router Standard / Router Spec / Router React in a new session
 ```
 
-> Do NOT copy the `preset` directory as a whole — the extra nesting hides the
-> presets from DSH discovery.
-
-**DSH Target**: `>=0.1.0-rc.6 <0.2.0` (tracked through rc.8 / 0.1.1-rc.2 / 0.1.2-alpha.1 / **0.1.5-rc.3**;
+**DSH Target**: `>=0.2.0-rc.2` (verified on **0.2.1-rc.4**: all three router presets, graded, injector self-test 8/8; for 0.1.x use a commit before this one;
 breaking-change log in `preset/CHANGELOG.md`).
 
 ## Components

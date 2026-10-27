@@ -18,7 +18,11 @@
   "homepage": "https://github.com/yjh051108/dsh-router-standard",
   "type": "module",
   "files": [
-    "preset/",
+    "router-standard/",
+    "router-spec/",
+    "router-react/",
+    "bundle/",
+    "scripts/gen-bundle-patch.mjs",
     "docs/",
     "README.md",
     "CHANGELOG.md",

@@ -22,6 +22,11 @@
 > 本文档给 agent/开发者：怎么改、怎么验、怎么同步到 DSH、怎么生效。
 > 权威规范（哲学/设计）见 `README.md` 与 `docs/`；演进史见 `CHANGELOG.md`。
 
+> ⚠️ **DSH >=0.2**：`~/.dsh/.agent-presets/` 不再被扫描，下文「运行目录 / sync-preset /
+> dev_reload_preset」链路对 0.2 无效。0.2 的链路：改 `<preset>/agent.cordis.yml` 或 `.mjs` →
+> `npm run gen:bundle`（生成 `bundle/*.patch.yml`）→ 本目录已经 `dsh plugin --profile web add ./preset`
+> 装配为 bundle → 改 bundle patch 后需重启 DSH（或 `dsh plugin remove/add dsh-router-standard` 触发 live 重载）。
+
 ## 开发链路全貌
 
 ```

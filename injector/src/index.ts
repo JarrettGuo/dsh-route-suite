@@ -27,7 +27,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync, cpSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -504,8 +504,8 @@ export interface Config {
   profileNodeModules: string
   /** 启动时自动恢复清单中的注入。 */
   autoRestore: boolean
-  /** 三组件自装配（PR#114 feat 有条件采纳）：激活后把包内捆绑的 preset/ 复制到
-   * $DSH_HOME/.agent-presets（仅缺失项，不覆盖用户改动）。 */
+  /** 三组件自装配（PR#114 feat 有条件采纳）：激活后把包内捆绑的 preset/ 装配为
+   * profile bundle（DSH >=0.2：dependencies link: + bundles，幂等）。 */
   provisionPresets: boolean
   /** 三组件自装配：激活后把包内捆绑的 graded/ 装配进 profile（link: 依赖 + bundles +
    * junction + 热装配，幂等）。默认 **false**——graded 是 0.0.1-rc1 实验组件，自动写
@@ -1109,17 +1109,29 @@ export function apply(ctx: AppContext, config: Config): void {
             // 是 reboot 上下文的必要适配，且需 _disposing 豁免（entry._dispose
             // 官方计数）与 disabled 兜底清理。
             const entry = selfEntry as any
-            if (!entry || typeof entry._dispose !== 'function') {
-              throw new Error('selfEntry 无官方 _dispose（loader 契约缺失）')
+            if (!entry || !entry.fiber) {
+              throw new Error('selfEntry 无活跃 fiber（loader 契约缺失）')
             }
             const rebootCtx = ctx.root as any
             const previousPlugin = entry.fiber?.runtime?.callback ?? null
-            const fresh = rebootCtx.loader.unwrapExports(
-              await entry.parent.tree.import(entry.options.name, () => []),
-            )
-            await entry._dispose()
+            // 新 fiber 挂回原父上下文（与 dsh-hmr 的替换同构；父 ctx 属 loader，恒活跃）
+            const parentRegistry = typeof entry._dispose === 'function' ? rebootCtx.registry : (entry.fiber.parent?.registry ?? rebootCtx.registry)
+            const freshNs = await entry.parent.tree.import(entry.options.name, () => [])
+            const fresh = rebootCtx.loader.unwrapExports(freshNs)
+            if (typeof entry._dispose === 'function') {
+              await entry._dispose()
+            } else {
+              // loader >=1.0.6（DSH 0.2）移除了 _dispose：按 dsh-hmr 官方顺序
+              // registry.delete(旧插件) —— 旧插件已不在 registry，loader 的
+              // internal/plugin 卸载监听不会把 entry 标记 disabled 写回 patch
+              const old = entry.fiber
+              rebootCtx.registry.delete(previousPlugin)
+              await old.await?.()
+            }
             const startWith = async (plugin: any): Promise<void> => {
-              const fiber = rebootCtx.registry.plugin(plugin, entry.options.config ?? {}, entry.getOuterStack)
+              const created = parentRegistry.plugin(plugin, entry.options.config ?? {}, entry.getOuterStack)
+              const fiber = created?.ctx?.fiber ?? created
+              if (plugin === fresh) entry.moduleNamespace = freshNs
               fiber.entry = entry
               entry.fiber = fiber
               await fiber.await()
@@ -3199,8 +3211,15 @@ export function apply(ctx: AppContext, config: Config): void {
         writeFileSync(join(tmpDir, 'src', 'index.ts'), `import type { Context } from '@deepseek-ai/cordis'\nimport { defineTool } from '@deepseek-ai/dsh-tools'\nexport const name = ${JSON.stringify(TEST_PKG)}\nexport const inject = ['tools']\nexport function apply(ctx: Context): void {\n  ctx.effect(() => ctx.tools.register(defineTool({\n    name: 'self_test_hello',\n    description: 'self test',\n    parameters: {},\n    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },\n    async execute() { return 'hello' },\n  })), 'self-test')\n}\n`, 'utf8')
         writeFileSync(join(tmpDir, 'scripts', 'build.sh'), `#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")/.." && pwd)"\ncd "$ROOT"\nCHECKOUT="\${DSH_CHECKOUT:-}"\nif [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then echo "no checkout" >&2; exit 1; fi\nTSC="$CHECKOUT/node_modules/.bin/tsc"\nlink_pkg() {\n  node -e "const fs=require('fs');const path=require('path');const l=path.resolve(process.argv[1]);const t=path.resolve(process.argv[2]);fs.rmSync(l,{recursive:true,force:true});fs.mkdirSync(path.dirname(l),{recursive:true});fs.symlinkSync(t,l,process.platform==='win32'?'junction':'dir');" "node_modules/$1" "$2"\n}\nmkdir -p node_modules/@deepseek-ai\nnode -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"\nlink_pkg @deepseek-ai/cordis "$CHECKOUT/vendor/cordis"\nlink_pkg @deepseek-ai/cosmokit "$CHECKOUT/vendor/cosmokit"\nlink_pkg @deepseek-ai/schemastery "$CHECKOUT/vendor/schemastery"\nlink_pkg @deepseek-ai/dsh-tools "$CHECKOUT/packages/core/tools"\nlink_pkg @types/node "$CHECKOUT/node_modules/@types/node"\n"$TSC" -p tsconfig.json\n`, 'utf8')
         const checkout = detectCheckout()
-        if (!checkout) { check('checkout 探测', false, '无 DSH_CHECKOUT'); return summarize(results) }
+        // npm 安装的 DSH（>=0.2）无源码 checkout：跳过构建，直接写入预构建的空插件 lib
+        // （注入/重载/卸载链路只看 fiber，不依赖工具注册）
+        if (!checkout) {
+          mkdirSync(join(tmpDir, 'lib'), { recursive: true })
+          writeFileSync(join(tmpDir, 'lib', 'index.js'), `export const name = ${JSON.stringify(TEST_PKG)}\nexport function apply() {}\n`, 'utf8')
+          check('测试插件构建', true, '跳过（无 DSH_CHECKOUT，使用预构建 lib）')
+        }
         // ── 2. 构建测试插件 ──
+        if (checkout) {
         const bash = findBash()
         if (!bash) { check('bash 探测', false, '无 bash'); return summarize(results) }
         const bashBinDir = bash !== 'bash' ? dirname(bash) : ''
@@ -3211,6 +3230,7 @@ export function apply(ctx: AppContext, config: Config): void {
         const libBuilt = existsSync(join(tmpDir, 'lib', 'index.js'))
         check('测试插件构建', br !== null && br.code === 0 && libBuilt, br && br.code !== 0 ? br.output.slice(-300) : (libBuilt ? '' : 'lib/index.js 未生成'))
         if (!br || br.code !== 0 || !libBuilt) return summarize(results)
+        }
         // ── 3. 注入 → host ✓ ──
         // ⚠️ 先清理上次自检可能的残留（整体 FAIL 中断时 finally 不一定跑完——
         // 实测：注入报「已激活运行」因为残留 entry 没卸载）
@@ -3304,6 +3324,7 @@ export function apply(ctx: AppContext, config: Config): void {
           let cleaned = patchText
           cleaned = cleaned.replace(/\n# self-test \d+\n- id: self-test-check\n  disabled: true\n?/, '')
           cleaned = cleaned.replace(/\n# 已卸载插件（[^\n]*\n- id: selftest-runner\n  disabled: true\n?/, '')
+          cleaned = cleaned.replace(/\s+$/, '\n') // 不在用户 patch 尾部累积空行（每跑一次 +2 行）
           const stillEntries = /^\s*- id:/m.test(cleaned)
           const finalPatch = stillEntries
             ? cleaned
@@ -3385,48 +3406,26 @@ export function apply(ctx: AppContext, config: Config): void {
     return null
   }
 
-  function provisionPresets(suiteRoot: string): string[] {
-    const presetRoot = join(suiteRoot, 'preset')
-    const targetRoot = join(dshHome, '.agent-presets')
-    let names: string[]
-    try {
-      names = readdirSync(presetRoot, { withFileTypes: true })
-        .filter((e) => e.isDirectory() && existsSync(join(presetRoot, e.name, 'preset.yml')))
-        .map((e) => e.name)
-    } catch (e) {
-      return [`presets: 捆绑预设目录不可读（跳过）: ${String(e)}`]
-    }
+  /** 把套装内的子包（preset / graded）装配为 profile bundle：dependencies link: +
+   * bundles + junction（幂等）。DSH >=0.2 不再扫描 .agent-presets/，预设只能经
+   * bundle patch 声明；preset 是纯 patch bundle（无 lib 入口）→ 不 loader.create，
+   * 重启后由 bundles 接管。 */
+  async function provisionBundle(suiteRoot: string, label: 'preset' | 'graded', hotLoad: boolean): Promise<string[]> {
     const notes: string[] = []
-    for (const name of names) {
-      const target = join(targetRoot, name)
-      if (existsSync(join(target, 'preset.yml'))) continue // 已有：不覆盖用户改动
-      try {
-        mkdirSync(targetRoot, { recursive: true })
-        cpSync(join(presetRoot, name), target, { recursive: true })
-        notes.push(`preset ${name} 已装配 → ${target}`)
-      } catch (e) {
-        notes.push(`preset ${name} 装配失败: ${String(e)}`)
-      }
-    }
-    return notes
-  }
-
-  async function provisionGraded(suiteRoot: string): Promise<string[]> {
-    const notes: string[] = []
-    const gradedDir = join(suiteRoot, 'graded')
-    const pkgPath = join(gradedDir, 'package.json')
-    if (!existsSync(pkgPath)) return ['graded: 包内无捆绑（跳过）']
+    const pkgDir = join(suiteRoot, label)
+    const pkgPath = join(pkgDir, 'package.json')
+    if (!existsSync(pkgPath)) return [`${label}: 包内无捆绑（跳过）`]
     let pkgName = ''
     try {
       pkgName = String(JSON.parse(readFileSync(pkgPath, 'utf8')).name ?? '')
     } catch {
-      return ['graded: package.json 解析失败（跳过）']
+      return [`${label}: package.json 解析失败（跳过）`]
     }
-    if (!pkgName) return ['graded: package.json 缺 name（跳过）']
+    if (!pkgName) return [`${label}: package.json 缺 name（跳过）`]
 
     const profileDir = dirname(profileNodeModules)
     const profilePkgPath = join(profileDir, 'package.json')
-    if (!existsSync(profilePkgPath)) return ['graded: profile package.json 不存在（跳过）']
+    if (!existsSync(profilePkgPath)) return [`${label}: profile package.json 不存在（跳过）`]
 
     // profile package.json（dependencies link: + bundles，幂等）：重启后由
     // bundles 正常接管——与 dev_install_package 双路径一致。
@@ -3438,7 +3437,7 @@ export function apply(ctx: AppContext, config: Config): void {
       profilePkg.dsh.profile.bundles = profilePkg.dsh.profile.bundles ?? []
       const steps: string[] = []
       if (!profilePkg.dependencies[pkgName]) {
-        profilePkg.dependencies[pkgName] = 'link:' + gradedDir
+        profilePkg.dependencies[pkgName] = 'link:' + pkgDir
         steps.push(`dependencies += ${pkgName}`)
       }
       if (!profilePkg.dsh.profile.bundles.includes(pkgName)) {
@@ -3447,10 +3446,10 @@ export function apply(ctx: AppContext, config: Config): void {
       }
       if (steps.length) {
         writeFileSync(profilePkgPath, JSON.stringify(profilePkg, null, 2) + '\n', 'utf8')
-        notes.push(`graded: profile package.json 已更新（${steps.join(', ')}）`)
+        notes.push(`${label}: profile package.json 已更新（${steps.join(', ')}）`)
       }
     } catch (e) {
-      return [...notes, `graded: profile package.json 更新失败: ${String(e)}`]
+      return [...notes, `${label}: profile package.json 更新失败: ${String(e)}`]
     }
 
     // node_modules junction（@scope/name 两级；悬空链接重建，lstat 判链接本体）
@@ -3462,13 +3461,17 @@ export function apply(ctx: AppContext, config: Config): void {
       if (!linkOk) {
         try { rmSync(linkPath, { recursive: true, force: true }) } catch { /* 覆盖重建 */ }
         mkdirSync(dirname(linkPath), { recursive: true })
-        symlinkSync(gradedDir, linkPath, 'junction')
-        notes.push(`graded: junction 已建立 → ${linkPath}`)
+        symlinkSync(pkgDir, linkPath, 'junction')
+        notes.push(`${label}: junction 已建立 → ${linkPath}`)
       }
     } catch (e) {
-      return [...notes, `graded: junction 失败: ${String(e)}`]
+      return [...notes, `${label}: junction 失败: ${String(e)}`]
     }
 
+    if (!hotLoad) {
+      if (notes.length) notes.push(`${label}: 重启 DSH 后由 bundles 生效`)
+      return notes
+    }
     // loader 热装配（幂等：entry 已存在则跳过）
     try {
       let exists = false
@@ -3478,14 +3481,14 @@ export function apply(ctx: AppContext, config: Config): void {
       }
       if (!exists) {
         await ctx.loader.create({ name: pkgName, config: {} })
-        notes.push('graded: loader.create 已热装配（免重启生效）')
+        notes.push(`${label}: loader.create 已热装配（免重启生效）`)
       } else {
-        notes.push('graded: loader entry 已存在（跳过）')
+        notes.push(`${label}: loader entry 已存在（跳过）`)
       }
       normalizeEntriesByName(pkgName)
       refreshClientRow(pkgName)
     } catch (e) {
-      notes.push(`graded: 热装配失败（重启后由 bundles 接管）: ${String(e)}`)
+      notes.push(`${label}: 热装配失败（重启后由 bundles 接管）: ${String(e)}`)
     }
     return notes
   }
@@ -3503,8 +3506,8 @@ export function apply(ctx: AppContext, config: Config): void {
             return
           }
           const notes: string[] = []
-          if (provisionPresetsOn) notes.push(...provisionPresets(suiteRoot))
-          if (provisionGradedOn) notes.push(...await provisionGraded(suiteRoot))
+          if (provisionPresetsOn) notes.push(...await provisionBundle(suiteRoot, 'preset', false))
+          if (provisionGradedOn) notes.push(...await provisionBundle(suiteRoot, 'graded', true))
           if (notes.length) {
             for (const n of notes) logger.info('[super-injector] 自装配: %s', n)
             auditLog('provision-ok', notes.join(' | '))

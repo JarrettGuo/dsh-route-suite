@@ -71,7 +71,7 @@
           # 渐进披露路由（v1.17）：阶段化解锁 + native 直调 + 主动性引导 + 二级注册表。
 
           - id: router-bootstrap
-            name: 'file:///home/ubuntu/workspace/settings/dsh-routing-suite/preset/router-standard/router-bootstrap-v34.mjs?v=91'
+            name: 'dsh-router-standard/router-standard/router-bootstrap-v34.mjs?v=91'
             config: {}
 
           # ── shell（win32：Git Bash 私有 shell seam——机制参照 liceses/dsh-gitbash-preset, MIT）──
@@ -88,7 +88,7 @@
               shell: true
             config:
               - id: gitbash-executor
-                name: 'file:///home/ubuntu/workspace/settings/dsh-routing-suite/preset/router-standard/gitbash-executor.mjs?v=49'
+                name: 'dsh-router-standard/router-standard/gitbash-executor.mjs?v=49'
                 disabled: !!js process.platform !== 'win32'
                 config: {}
 
@@ -307,7 +307,7 @@
           - id: tool-web
             name: '@deepseek-ai/dsh-tool-web'
             config:
-              fetch: false
+              fetch: true
               searchTimeoutMs: 60000
 
           # ── presentation ────────────────────────────────────────────────────────────

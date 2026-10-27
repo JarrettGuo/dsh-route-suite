@@ -27,6 +27,8 @@
     "preset/router-standard",
     "preset/router-spec",
     "preset/router-react",
+    "preset/bundle",
+    "preset/package.json",
     "graded/package.json",
     "graded/dsh.plugin.json",
     "graded/cordis.patch.yml",

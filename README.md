@@ -35,7 +35,7 @@ dsh plugin --profile web add github:yjh051108/dsh-routing-suite
 `files` 白名单打包）；preset 与 graded 由注入器在**首次激活后自动补装**（约 1.5s 后执行，
 全部幂等、失败不阻塞 boot）：
 
-- `preset/router-*` → 复制到 `$DSH_HOME/.agent-presets/`（仅缺失项，**永不覆盖**用户已改的预设）；
+- `preset/` → 作为 bundle（包名 `dsh-router-standard`）写入 profile `dependencies`（`link:`）+ `bundles`、建 junction（DSH 0.2 起预设只能经 bundle patch 声明，`.agent-presets/` 不再被扫描）；重启 DSH 后三个预设出现在新会话的预设列表；
 - `graded/` → 写入 profile `dependencies`（`link:`）+ `bundles`、建 junction、`loader.create` 热装配（免重启生效，重启后由 bundles 正常接管）。**默认关闭**（0.0.1-rc1 实验组件，显式开启：注入器配置 `provisionGraded: true`）；preset 自装配可关：`provisionPresets: false`。
 
 装配结果见 `~/.dsh/super-injector/self-heal.log`（`provision-*` 事件）。
@@ -43,7 +43,7 @@ dsh plugin --profile web add github:yjh051108/dsh-routing-suite
 形态已随 `files` 打包），否则会把旧 `text` 形态铺出去（复现 #101/#109）。与
 install.sh/ps1 脚本安装二选一即可。
 
-**DSH Target**：`>=0.1.0-rc.6 <0.2.0`（已跟进 rc.8 / 0.1.1-rc.2 / 0.1.2-alpha.1 / **0.1.5-rc.3**）
+**DSH Target**：`>=0.2.0-rc.2`（已在 **0.2.1-rc.4** 实测：三个 router 预设 / graded / 注入器自检 8/8；0.1.x 请用 v0.3.3 之前的提交）
 
 > DSH 目前处于 developer preview，官方明示会有破坏性变更（breaking changes）。
 > 本仓库的版本跟进记录见 `preset/CHANGELOG.md`。
@@ -55,7 +55,7 @@ install.sh/ps1 脚本安装二选一即可。
 git clone https://github.com/yjh051108/dsh-routing-suite.git
 cd dsh-routing-suite
 
-# 2. 一键安装（注入器装配 + 预设复制 + graded 装配 + 布局自检 + 提示重启；DSH_HOME 优先，FORCE=1 覆盖重装）
+# 2. 一键安装（注入器装配 + 预设 bundle 装配 + graded 装配 + 自检 + 提示重启；DSH_HOME 优先，FORCE=1 重装 graded）
 .\install.ps1
 ```
 
@@ -66,20 +66,15 @@ cd dsh-routing-suite
 dsh plugin --profile web add .\injector
 # dsh 不在 PATH 时：npx '@deepseek-ai/dsh' plugin --profile web add .\injector
 
-# 步骤 2：安装 router 预设（每个预设目录平铺复制到 .agent-presets 下，DSH 只扫一级子目录）
-$target = Join-Path $env:DSH_HOME '.agent-presets\router-standard'
-Copy-Item -Recurse .\preset\router-standard $target
-
-$target = Join-Path $env:DSH_HOME '.agent-presets\router-spec'
-Copy-Item -Recurse .\preset\router-spec $target
+# 步骤 2：安装 router 预设（DSH 0.2：preset\ 是一个 bundle 包，三个预设由 bundle\*.patch.yml 声明）
+dsh plugin --profile web add .\preset
+# 改了 preset\<name>\agent.cordis.yml 后：cd preset; npm run gen:bundle
 
 # 步骤 3（可选）：安装 graded 分级模式（实验组件，仓库内预构建发布物；/分级 on 激活，不激活零痕迹）
 dsh plugin --profile web add .\graded\dsh-external-dsh-graded-mode-0.0.1-rc1.tgz
 
 # 步骤 4：重启 DSH → 新会话选择 Router Standard / Router Spec (experimental) / Router React
 ```
-
-> 注意：不要复制 `preset` 整目录（会多套一层，DSH 发现不了预设）。
 
 ## 组件
 

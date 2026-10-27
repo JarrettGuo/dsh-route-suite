@@ -162,16 +162,14 @@ version of that external routing.
 
 ## Usage
 
-**Two presets** (v0.3.0; the router-pro line was retired): install one or more under `~/.dsh/.agent-presets/`:
+**Presets** (router-standard / router-spec / router-react): DSH >=0.2 no longer scans
+`~/.dsh/.agent-presets/`; this directory is a bundle package (`dsh-router-standard`) whose
+`bundle/*.patch.yml` declare the presets. Install it once into the profile:
 
 ```powershell
-# 标准路由预设（RL 接口还原，默认推荐）
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-standard'
-Copy-Item -Recurse .\preset\router-standard $target
-
-# spec 路由预设（深度思考优先）
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-spec'
-Copy-Item -Recurse .\preset\router-spec $target
+dsh plugin --profile web add .\preset
+# 改了 <preset>/agent.cordis.yml 后重新生成 bundle patch：
+npm run gen:bundle
 ```
 
 **免重启安装（推荐）**：装好 [dsh-super-injector](https://github.com/yjh051108/dsh-super-injector)
